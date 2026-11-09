@@ -196,17 +196,27 @@ class Bands:
 class LiquidContour:
     """Centered liquid sphere with outward expanding concentric radio rings.
 
-    Total points across core sphere + active concentric rings is ~400 points,
-    yielding 50 Hz refresh rate at 20 kpps (completely flicker-free).
+    Each spline is sampled densely enough that doubling the figure still keeps
+    adjacent samples under 225 ILDA units and curvature under 15.
     """
+    # Two closed splines share this count. 360 keeps a 2x-radius figure inside
+    # the segment and curvature caps.
+    N_CORE = 360
     def __init__(self, seed=42):
         self.random = random.Random(seed)
-        self.rings = []  # (birth_time, color)
+        self.rings = []  # (birth, color, amplitude, reach, life)
         self.last_onset = -10.0
         self.phase = 0.0
         self.color_phase = 0.0
         self.tilt_phase = 0.0
         self.onsets = 0
+        # Viscous followers: fast attack, short release. They settle instead of
+        # riding the whole note.
+        self.excite = [0.0, 0.0, 0.0]
+
+    def _follow(self, current, target, dt, release):
+        tau = 0.02 if target > current else release
+        return current + (target - current) * (1.0 - math.exp(-dt / tau))
 
     def sample(self, level, bands, now, dt, depth=.07, frequency=8, flux=0., centroid=.25, pitch_angle=None,
                sub_flux=None, beat_phase=0., hat_phase=0., beat_lock=0., hat_lock=0., activity=None,
@@ -214,75 +224,117 @@ class LiquidContour:
         bass, mid, high = bands
         kick_f, snare_f, hat_f = sub_flux if sub_flux is not None else (flux * bass, flux * mid, flux * high)
         act = min(1.0, max(0.0, activity if activity is not None else max(level, max(bands))))
-        step_dt = min(dt, 0.05)
-        self.phase += (1.4 + 2.4 * bass + 1.2 * act) * step_dt
-        self.color_phase += (1.8 + 4.5 * max(bands) + 2.0 * centroid) * step_dt
-        self.tilt_phase += (0.85 + 1.6 * bass) * step_dt
+        step_dt = min(max(dt, 0.0), 0.05)
+        damp_dt = min(max(dt, 0.0), 0.50)
+        # Bass lingers a little, hats die quickly. None of them hold the pose.
+        self.excite[0] = self._follow(self.excite[0], kick_f, damp_dt, 0.16)
+        self.excite[1] = self._follow(self.excite[1], snare_f, damp_dt, 0.11)
+        self.excite[2] = self._follow(self.excite[2], hat_f, damp_dt, 0.06)
+        eb, em, eh = self.excite
+        strength = max(eb, em, eh)
+        self.phase += (0.30 + 0.22 * bass + 1.8 * eb + 1.1 * em) * step_dt
+        self.color_phase += (0.35 + 0.25 * max(bands) + 2.4 * strength + 0.4 * centroid) * step_dt
+        self.tilt_phase += (0.25 + 1.2 * eb) * step_dt
 
-        # Spawn new expanding concentric radio ring on beat kicks / snare hits
-        if act > 0.18 and (kick_f > 0.24 or bass > 0.20 or snare_f > 0.28) and (now - self.last_onset) > 0.28:
+        # Impulse amplitude picks the response. A soft hit only stirs the
+        # surface; a medium hit sends a short round ring; a hard hit throws
+        # a wavy ring out to the boundary.
+        amp = max(kick_f, snare_f, 0.45 * hat_f)
+        if amp > 0.22 and (now - self.last_onset) > 0.30:
             self.last_onset = now
             self.onsets += 1
-            col = (110, 220, 255) if kick_f >= snare_f else (255, 185, 80)
-            self.rings.append((now, col))
+            if amp < 0.48:
+                reach, life = 0.30, 0.40
+                col = (80, 150, 190) if kick_f >= snare_f else (150, 80, 180)
+            elif amp < 0.74:
+                reach, life = 0.62, 0.68
+                col = (110, 220, 255) if kick_f >= snare_f else (255, 185, 80)
+            else:
+                reach, life = 1.0, 0.92
+                col = (220, 245, 255) if kick_f >= snare_f else (255, 214, 96)
+            self.rings.append((now, col, amp, reach, life))
+        self.rings = [ring for ring in self.rings if now - ring[0] < ring[4]][-2:]
 
-        MAX_AGE = 1.35
-        updated = []
-        for birth, col in self.rings:
-            age = now - birth
-            if age < MAX_AGE:
-                updated.append((birth, col))
-        self.rings = updated[-2:]
-
-        N_CORE = 220
-        amount = depth / 0.10
-        r_core = (2400.0 + 1900.0 * level) * (0.82 + 0.18 * act)
-        r_max = 8200.0
+        N_CORE = self.N_CORE
+        amount = min(1.0, max(0.0, depth / 0.10))
+        # Twice the previous resting radius. The activity term is unchanged.
+        r_core = (4800.0 + 3800.0 * level) * (0.82 + 0.18 * act)
+        # A full 2x of the old 7300 outer ring would pass the 13000 Y limit
+        # once the ring wave is added, so the outer edge stops just inside it.
+        r_draw = 11800.0
         coords = []
         colors = []
         blanks = []
 
-        # --- 1. Centered Liquid Core Sphere (220 points) ---
-        for i in range(N_CORE):
-            a = 2 * math.pi * i / (N_CORE - 1)
-            blank = (i in (0, N_CORE - 1))
-            w = (0.26 * amount * bass * math.sin(2 * a - self.phase)
-                 + 0.13 * amount * mid * math.sin(3 * a + self.phase)
-                 + 0.025 * amount * high * math.sin(frequency * a - 2 * self.phase))
-            # Increased surface displacement (0.35 vs 0.22) with smooth non-clipping curve
-            r = r_core * (1.0 + 0.35 * math.tanh(1.2 * w))
-            px = r * math.cos(a)
-            py = r * math.sin(a)
-            coords.append((round(px), round(py)))
-            blanks.append(blank)
-            s_r = max(0.0, math.sin(a - self.color_phase)) ** 1.6
-            s_g = max(0.0, math.sin(a - self.color_phase + 2.094)) ** 1.6
-            s_b = max(0.0, math.sin(a - self.color_phase + 4.188)) ** 1.6
-            rc = int(min(255, 18 + 220 * s_r * (0.2 + 0.8 * bass)))
-            gc = int(min(255, 22 + 200 * s_g * (0.2 + 0.8 * (mid + high))))
-            bc = int(min(255, 60 + 190 * s_b))
-            colors.append((0, 0, 0) if blank else (rc, gc, bc))
+        fine = min(8, max(5, int(frequency) + 3))
 
-        # --- 2. Outward Expanding Concentric Radio Rings (220 points) ---
-        N_RING = 220
-        for birth, col in self.rings:
+        def tint(angle, scale):
+            s_r = max(0.0, math.sin(angle - self.color_phase)) ** 1.6
+            s_g = max(0.0, math.sin(angle - self.color_phase + 2.094)) ** 1.6
+            s_b = max(0.0, math.sin(angle - self.color_phase + 4.188)) ** 1.6
+            rc = int(min(255, scale * (18 + 220 * s_r * (0.2 + 0.8 * bass + 0.5 * eb))))
+            gc = int(min(255, scale * (22 + 200 * s_g * (0.2 + 0.8 * (mid + high) + 0.6 * em))))
+            bc = int(min(255, scale * (60 + 190 * s_b)))
+            return rc, gc, bc
+
+        def add_spline(radius_at, scale):
+            samples = []
+            for i in range(N_CORE):
+                angle = 2 * math.pi * i / (N_CORE - 1)
+                radius = radius_at(angle)
+                samples.append((radius * math.cos(angle), radius * math.sin(angle), tint(angle, scale)))
+            if coords:
+                coords.append(coords[-1])
+                colors.append((0, 0, 0))
+                blanks.append(True)
+                coords.append((round(samples[0][0]), round(samples[0][1])))
+                colors.append((0, 0, 0))
+                blanks.append(True)
+            for i, (x, y, rgb) in enumerate(samples):
+                blank = i in (0, N_CORE - 1)
+                coords.append((round(x), round(y)))
+                colors.append((0, 0, 0) if blank else rgb)
+                blanks.append(blank)
+
+        def body_wave(angle):
+            return (amount * (0.16 * bass + 0.70 * eb) * math.sin(2 * angle - self.phase)
+                    + amount * (0.05 * mid + 0.55 * em) * math.sin(3 * angle + self.phase)
+                    + amount * strength * (0.02 * high + 0.40 * eh) * math.sin(min(6, frequency) * angle - 2 * self.phase))
+
+        # Underlay: the same closed spline, with an extra higher harmonic.
+        # Drawn first so the damped body and the rings stroke over it.
+        def fine_radius(angle):
+            ripple = (0.35 + bass + 0.65 * mid + 0.45 * high) * math.sin(fine * angle - 2.2 * self.phase)
+            return r_core * (1.0 + 0.16 * math.tanh(1.15 * body_wave(angle)) + 0.012 * ripple)
+
+        def body_radius(angle):
+            gain = 0.16 + 0.18 * strength
+            return r_core * (1.0 + gain * math.tanh(1.15 * body_wave(angle)))
+
+        add_spline(fine_radius, 0.72)
+        add_spline(body_radius, 1.0)
+
+        # Enough samples that the outer ring stays under the 225 ILDA step cap.
+        N_RING = max(N_CORE, math.ceil(2 * math.pi * r_draw / 180) + 1)
+        for birth, col, ring_amp, reach, life in self.rings:
             age = now - birth
-            frac = age / MAX_AGE
-            rw = r_core + (r_max - r_core) * frac
-            fade = max(0.0, (1.0 - frac) ** 0.85) * act
-            if fade < 0.05: continue
+            frac = min(1.0, max(0.0, age / life))
+            fade = max(0.0, (1.0 - frac) ** 1.65) * (0.30 + 0.70 * ring_amp)
+            if fade < 0.05:
+                continue
+            rw = min(r_draw, r_core + (r_draw - r_core) * reach * frac)
             coords.append(coords[-1])
             colors.append((0, 0, 0))
             blanks.append(True)
-            coords.append((round(rw * (1.0 + 0.16 * math.tanh(0.15 * bass * math.sin(0)))), 0))
+            coords.append((round(rw), 0))
             colors.append((0, 0, 0))
             blanks.append(True)
             for j in range(N_RING):
                 a = 2 * math.pi * j / (N_RING - 1)
                 blank = (j in (0, N_RING - 1))
-                # Expanding radio wave ring carries undulating wave deformation
-                w_ring = 0.15 * bass * math.sin(2 * a - self.phase) + 0.08 * mid * math.sin(3 * a + self.phase)
-                r_ring = rw * (1.0 + 0.16 * math.tanh(w_ring) * fade)
+                # Soft rings stay round. Hard rings carry a deeper wave.
+                w_ring = ring_amp * (0.20 * math.sin(2 * a - self.phase) + 0.10 * math.sin(3 * a + self.phase))
+                r_ring = rw * (1.0 + 0.08 * math.tanh(w_ring) * fade)
                 ax = r_ring * math.cos(a)
                 ay = r_ring * math.sin(a)
                 coords.append((round(ax), round(ay)))
