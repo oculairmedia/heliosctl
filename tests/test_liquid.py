@@ -48,11 +48,11 @@ class LiquidTests(unittest.TestCase):
             for _ in range(80):
                 now[0] += .025
                 native = f[0]
-                self.assertGreaterEqual(len(native), 160)  # Core (160) + optional concentric rings (240)
+                self.assertGreaterEqual(len(native), 220)  # Core (220) + optional concentric rings (220)
                 # Core seam closes
-                self.assertEqual((native[0].x, native[0].y), (native[159].x, native[159].y))
+                self.assertEqual((native[0].x, native[0].y), (native[219].x, native[219].y))
                 self.assertEqual((native[0].r, native[0].g, native[0].b, native[0].i), (0, 0, 0, 0))
-                self.assertEqual((native[159].r, native[159].g, native[159].b, native[159].i), (0, 0, 0, 0))
+                self.assertEqual((native[219].r, native[219].g, native[219].b, native[219].i), (0, 0, 0, 0))
                 for p in native:
                     self.assertLessEqual(abs(p.x*16-32768), 16016)
                     self.assertLessEqual(abs(p.y*16-32768), 13016)
@@ -63,7 +63,7 @@ class LiquidTests(unittest.TestCase):
                 final.append([(p.x, p.y) for p in native])
             r_base = (2400.0 + 1900.0 * f.geometry)
             radii = [math.hypot(p.x*16-32768, p.y*16-32768) / r_base
-                     for p in native[1:159]]
+                     for p in native[1:219]]
             self.assertGreater(max(radii) - min(radii), (.03, .015, .003)[index])
         self.assertNotEqual(final[0],final[1])
         self.assertNotEqual(final[1],final[2])
@@ -87,20 +87,20 @@ class LiquidTests(unittest.TestCase):
             for x, y in coords:
                 self.assertLessEqual(abs(x), 16000)
                 self.assertLessEqual(abs(y), 13000)
-            # Check core segments (0..159)
-            for j in range(159):
+            # Check core segments (0..219)
+            for j in range(219):
                 p, q = coords[j], coords[j + 1]
                 max_segment = max(max_segment, math.dist(p, q))
-            for j in range(1, 159):
+            for j in range(1, 219):
                 p, q, r = coords[j], coords[j + 1], coords[j - 1]
                 max_curve = max(max_curve, math.hypot(q[0]-2*p[0]+r[0], q[1]-2*p[1]+r[1]))
             # Check concentric ring segments if present
-            if len(coords) >= 402:
-                for j in range(239):
-                    p, q = coords[162 + j], coords[162 + j + 1]
+            if len(coords) >= 442:
+                for j in range(219):
+                    p, q = coords[222 + j], coords[222 + j + 1]
                     max_segment = max(max_segment, math.dist(p, q))
-                for j in range(1, 239):
-                    p, q, r = coords[162 + j], coords[162 + j + 1], coords[162 + j - 1]
+                for j in range(1, 219):
+                    p, q, r = coords[222 + j], coords[222 + j + 1], coords[222 + j - 1]
                     max_curve = max(max_curve, math.hypot(q[0]-2*p[0]+r[0], q[1]-2*p[1]+r[1]))
         self.assertLess(max_segment, 225)
         self.assertLess(max_curve, 15)

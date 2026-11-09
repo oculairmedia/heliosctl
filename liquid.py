@@ -178,7 +178,9 @@ class Bands:
         for i, e in enumerate(self.energy):
             floor = max((.004, .004, .002)[i], .65 * self.baseline[i])
             span = max((.018, .016, .012)[i], .78 * self.baseline[i])
-            raw_target = min(1., max(0., e - floor) / span)
+            # Soft saturation curve instead of hard min(1., ...): preserves dynamic
+            # contrast across loud sections and prevents flat-topping/clipping.
+            raw_target = math.tanh(max(0., e - floor) / span)
             target = raw_target * (0.35 + 0.65 * self.activity)
             tau_base = 1.2 if e > self.baseline[i] else 4.5
             self.baseline[i] += (max((.008, .008, .004)[i], e) - self.baseline[i]) * (1.0 - math.exp(-dt / tau_base))
@@ -232,7 +234,7 @@ class LiquidContour:
                 updated.append((birth, col))
         self.rings = updated[-2:]
 
-        N_CORE = 160
+        N_CORE = 220
         amount = depth / 0.10
         r_core = (2400.0 + 1900.0 * level) * (0.82 + 0.18 * act)
         r_max = 8200.0
@@ -240,14 +242,15 @@ class LiquidContour:
         colors = []
         blanks = []
 
-        # --- 1. Centered Liquid Core Sphere (160 points) ---
+        # --- 1. Centered Liquid Core Sphere (220 points) ---
         for i in range(N_CORE):
             a = 2 * math.pi * i / (N_CORE - 1)
             blank = (i in (0, N_CORE - 1))
-            w = (0.20 * amount * bass * math.sin(2 * a - self.phase)
-                 + 0.10 * amount * mid * math.sin(3 * a + self.phase)
+            w = (0.26 * amount * bass * math.sin(2 * a - self.phase)
+                 + 0.13 * amount * mid * math.sin(3 * a + self.phase)
                  + 0.025 * amount * high * math.sin(frequency * a - 2 * self.phase))
-            r = r_core * (1.0 + 0.22 * math.tanh(1.5 * w))
+            # Increased surface displacement (0.35 vs 0.22) with smooth non-clipping curve
+            r = r_core * (1.0 + 0.35 * math.tanh(1.2 * w))
             px = r * math.cos(a)
             py = r * math.sin(a)
             coords.append((round(px), round(py)))
@@ -260,8 +263,8 @@ class LiquidContour:
             bc = int(min(255, 60 + 190 * s_b))
             colors.append((0, 0, 0) if blank else (rc, gc, bc))
 
-        # --- 2. Outward Expanding Concentric Radio Rings (240 points each) ---
-        N_RING = 240
+        # --- 2. Outward Expanding Concentric Radio Rings (220 points) ---
+        N_RING = 220
         for birth, col in self.rings:
             age = now - birth
             frac = age / MAX_AGE
@@ -271,14 +274,17 @@ class LiquidContour:
             coords.append(coords[-1])
             colors.append((0, 0, 0))
             blanks.append(True)
-            coords.append((round(rw), 0))
+            coords.append((round(rw * (1.0 + 0.16 * math.tanh(0.15 * bass * math.sin(0)))), 0))
             colors.append((0, 0, 0))
             blanks.append(True)
             for j in range(N_RING):
                 a = 2 * math.pi * j / (N_RING - 1)
                 blank = (j in (0, N_RING - 1))
-                ax = rw * math.cos(a)
-                ay = rw * math.sin(a)
+                # Expanding radio wave ring carries undulating wave deformation
+                w_ring = 0.15 * bass * math.sin(2 * a - self.phase) + 0.08 * mid * math.sin(3 * a + self.phase)
+                r_ring = rw * (1.0 + 0.16 * math.tanh(w_ring) * fade)
+                ax = r_ring * math.cos(a)
+                ay = r_ring * math.sin(a)
                 coords.append((round(ax), round(ay)))
                 blanks.append(blank)
                 colors.append((0, 0, 0) if blank else (int(col[0] * fade), int(col[1] * fade), int(col[2] * fade)))
