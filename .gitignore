@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+!native/libHeliosDacAPI.so
+.venv/
+env/
+venv/
+*.receipt
+*.sock
+*.sock.lock
+.DS_Store

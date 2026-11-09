@@ -1,0 +1,10 @@
+#!/bin/sh
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
+    PYTHON="$SCRIPT_DIR/.venv/bin/python"
+elif [ -f "$HOME/.local/opt/heliosctl/.venv/bin/python" ]; then
+    PYTHON="$HOME/.local/opt/heliosctl/.venv/bin/python"
+else
+    PYTHON="python3"
+fi
+exec "$PYTHON" "$SCRIPT_DIR/heliosctl.py" "$@"
