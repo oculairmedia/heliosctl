@@ -284,6 +284,8 @@ DWELL_OFF = 2           # extra blank repeats of the last curve point before a j
 DWELL_ON = 3            # blank repeats at a landing point before relighting (galvo settle)
 BLANK_STEP = 760.0      # max ILDA step of an eased blank move (smoothstep peak ~1.5x mean)
 FOLD_OCTAVES = 3
+IMPRINT_MODES = 4       # body outline modes carried out by a ring (higher ones would kink a 200-pt ring)
+IMPRINT_BUDGET = 0.6    # max sum(|a_m| m^2) of the carried outline: <= ~4 units of ring curvature at r 6600
 CURV_MAX = 14.6         # emitted body second-difference ceiling (heliosctl galvo bound 15)
 GRAD_MAX = 0.20
 CURL_GAIN = 0.012       # shape contribution of the curl noise (psi itself still drives the 4D fold gradient)
@@ -472,6 +474,10 @@ class LiquidContour:
         self._oct_a = np.array([o[3] for o in octs], dtype=np.float64)
         self.rings = BeatRings()
         self.colors = None
+        self.punch = 0.0            # beat-birth body kick, 1 -> 0 over ~0.1 s
+        self.ring_obj = None        # identity of the ring being drawn (to catch births)
+        self.ring_hue = 0.0         # palette walk: each new ring steps by the golden angle
+        self.imprint = np.zeros(IMPRINT_MODES, dtype=np.complex128)   # body outline shed into the ring
 
     def sample(self, level, bands, now, dt, depth=.07, frequency=8, flux=0., centroid=.25, pitch_angle=None,
                sub_flux=None, beat_phase=0., hat_phase=0., beat_lock=0., hat_lock=0., activity=None,
@@ -522,6 +528,8 @@ class LiquidContour:
         drive = 0.55 * (beat_pulse + 0.45 * kick_f + 0.25 * snare_f) * act
         if on_beat:
             self.twist_vel += 1.2 * act
+            self.punch = 1.0
+        self.punch *= math.exp(-step_dt / 0.09)
         self.twist_vel += (2.2 * drive - 6.0 * self.twist - 2.2 * self.twist_vel) * step_dt
         self.twist = max(-0.85, min(0.85, self.twist + self.twist_vel * step_dt))
         # Smooth periodic fold 0..2 (the snapshot's sawtooth rot4d popped at its wrap).
@@ -529,7 +537,7 @@ class LiquidContour:
         fold = FOLD_GAIN * (1.0 - math.cos(self.rot4d))
 
         amount = depth / .10
-        r_core = (2400.0 + 1900.0 * level) * (0.82 + 0.18 * act)
+        r_core = (2400.0 + 1900.0 * level) * (0.82 + 0.18 * act) * (1.0 + 0.07 * self.punch * act)
         c_boost = 0.75 + 0.50 * centroid
         f_boost = 1.0 + 0.40 * max(flux, kick_f)
         low_amp = min(.40 * amount, .34 * amount * (bass + 0.28 * beat_pulse) * f_boost)
@@ -613,7 +621,9 @@ class LiquidContour:
         cr = np.minimum(255, 14 + 210 * s_r * (0.12 + 0.88 * act * (bass + 0.5 * energy)) + 150 * bass_glow + 140 * crest)
         cg = np.minimum(255, 22 + 200 * s_g * (0.18 + 0.82 * act * (mid + high)) + 170 * crest)
         cb = np.minimum(255, 55 + 195 * s_b * (0.40 + 0.60 * (1.0 - 0.3 * bass)) + 120 * mid_glow + 90 * crest)
-        core_col = np.stack((cr, cg, cb), axis=1).astype(np.int64)
+        core_col = np.stack((cr, cg, cb), axis=1)
+        flash = 0.40 * self.punch * act                    # the body lights up as it sheds a ring
+        core_col = np.minimum(255, core_col * (1.0 - flash) + 255.0 * flash).astype(np.int64)
 
         coords = [tuple(p) for p in core.tolist()]
         colors = [tuple(c) for c in core_col.tolist()]
@@ -626,18 +636,33 @@ class LiquidContour:
         fade = 0.0
         if ring is not None:
             frac = ring['frac']
-            fade = max(0.0, (1.0 - frac) ** 0.85) * (0.35 + 0.65 * act)
+            fade = max(0.0, 1.0 - frac ** 1.8) * (0.35 + 0.65 * act)   # holds its light, dies at the edge
         if ring is not None and fade >= 0.03:
             r0 = 1.18 * r_core
             rw = r0 + (RING_R_MAX - r0) * frac
-            col = ring['color']
+            if ring is not self.ring_obj:
+                # A new ring: next palette colour, and freeze the body's current low-order
+                # outline (modes 1..IMPRINT_MODES) so the ring leaves as a shell of the sphere.
+                self.ring_obj = ring
+                self.ring_hue = (self.ring_hue + 2.39996) % TWO_PI
+                prof = np.hypot(pts[:-1, 0], pts[:-1, 1])
+                spec = np.fft.rfft(prof / max(1e-6, float(np.mean(prof))) - 1.0) / len(prof)
+                imp = 2.0 * spec[1:IMPRINT_MODES + 1]
+                # curvature budget: a mode-m ripple of relative size a adds ~r*a*m^2*dtheta^2
+                # to the second difference, so cap sum(|a_m| m^2) instead of clipping (a clip kinks)
+                load = float(np.sum(np.abs(imp) * np.arange(1, IMPRINT_MODES + 1) ** 2))
+                self.imprint = imp * min(1.0, IMPRINT_BUDGET / max(1e-9, load))
             # Transit out and walk back cover the same radial gap at angle 0: dwell, eased
             # blank move, settle -- the mirrors must stop before the laser relights, or the
             # beam paints the jump (the 'line from the sphere to the ring').
+            modes = np.arange(1, IMPRINT_MODES + 1)
+            shell = (1.0 - frac) ** 1.3
+
             def ring_radius(ang):
                 w_ring = (0.12 * bass * np.sin(2 * ang - self.phase) + 0.07 * mid * np.sin(3 * ang + self.phase)
                           + 0.06 * self.twist * np.sin(2 * ang + 2 * self.phase))
-                return rw * (1.0 + 0.10 * np.tanh(w_ring) * min(1.0, 2.0 * fade))
+                carried = np.real(self.imprint @ np.exp(1j * np.outer(modes, ang)))
+                return rw * (1.0 + 0.05 * np.tanh(w_ring) * min(1.0, 2.0 * fade) + shell * carried)
             seam = coords[-1]
             land = (int(np.rint(ring_radius(np.zeros(1))[0])), 0)
             out = _blank_move(seam, land)
@@ -650,8 +675,15 @@ class LiquidContour:
             rpts = list(zip(rx.tolist(), ry.tolist()))
             rpts[0] = rpts[-1] = land
             dark = [seam] * DWELL_OFF + out + [rpts[0]] * DWELL_ON
-            lit = (int(col[0] * fade), int(col[1] * fade), int(col[2] * fade))
-            ring_cols = [lit] * n_ring
+            # Colour: white-hot at birth, cooling into a hue sweep around the ring that turns
+            # with the body; successive rings walk the palette so each beat reads as new.
+            hue = self.ring_hue + 1.1 * np.cos(ring_a - 1.5 * self.phase)
+            rgb = np.stack([np.maximum(0.0, np.sin(hue + off)) ** 1.2 for off in (0.0, 2.094, 4.188)], axis=1)
+            rgb = rgb / np.maximum(1e-6, rgb.max(axis=1, keepdims=True))
+            white = math.exp(-frac / 0.06)
+            bright = fade * (1.0 + 0.25 * white)
+            ring_rgb = np.clip(255.0 * (rgb * (1.0 - white) + white) * bright, 0, 255).astype(np.int64)
+            ring_cols = [tuple(c) for c in ring_rgb.tolist()]
             ring_cols[0] = ring_cols[-1] = (0, 0, 0)
             ring_blank = [False] * n_ring
             ring_blank[0] = ring_blank[-1] = True
