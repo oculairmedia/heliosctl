@@ -487,7 +487,7 @@ class RippleContour:
         return coords + coords[:1]
 
 
-LIQUID_PATTERNS = ('liquid', 'liquid2')   # share the Bands -> contour -> 450-point frame path
+LIQUID_PATTERNS = ('liquid', 'liquid2', 'liquid3')   # share the Bands -> contour -> 450-point frame path
 
 
 class AudioFrames:
@@ -505,6 +505,9 @@ class AudioFrames:
         if pattern == 'liquid2':
             from dynamic import DynamicContour     # shape-morphing variant, same frame contract
             self.liquid = DynamicContour()
+        elif pattern == 'liquid3':
+            from spark import SparkContour         # event-morph + hit-sparkle variant, same frame contract
+            self.liquid = SparkContour()
         else:
             self.liquid = LiquidContour()
         self.pcm_sequence = None
@@ -555,6 +558,8 @@ class AudioFrames:
             else:
                 bands = self.bands.decay(min(dt, .1))
             bands = [math.sqrt(min(1.0, max(0.0, v))) for v in bands]
+            # liquid3 classifies hits on the raw band energies; liquid/liquid2 get exactly the call they had
+            extra = {'energy': self.bands.energy} if self.pattern == 'liquid3' else {}
             coords, colors, blanks = self.liquid.sample(self.geometry, bands, now, dt,
                                                         self.ripple.depth, self.ripple.frequency,
                                                         flux=self.bands.flux, centroid=self.bands.centroid,
@@ -566,7 +571,7 @@ class AudioFrames:
                                                         hat_lock=self.bands.hat_lock,
                                                         activity=self.bands.activity,
                                                         beat_period=self.bands.beat_period,
-                                                        accent=self.bands.accent)
+                                                        accent=self.bands.accent, **extra)
             self.onset_count = self.liquid.onsets
         if self.meter and now >= self.next_meter:
             if self.pattern in LIQUID_PATTERNS:
@@ -683,8 +688,8 @@ def main(argv=None):
     audio.add_argument("--library", default=default_library())
     audio.add_argument('--gain', type=float, default=1.0, help='RMS geometry gain, >0 and <=32 (default 1; never changes intensity)')
     audio.add_argument('--meter', action='store_true', help='print aggregate RMS/target once per second during playback')
-    audio.add_argument('--pattern', choices=('plain', 'ripple', 'liquid', 'liquid2'), default='plain',
-                       help='plain, ripple, liquid (60-250/250-2000/2000-6000 Hz; 50Hz resolution) or liquid2 (liquid body that morphs between shapes on the beat, ring style per event); unchanged max extent/power')
+    audio.add_argument('--pattern', choices=('plain', 'ripple', 'liquid', 'liquid2', 'liquid3'), default='plain',
+                       help='plain, ripple, liquid (60-250/250-2000/2000-6000 Hz; 50Hz resolution), liquid2 (liquid body that morphs between shapes on the beat, ring style per event) or liquid3 (liquid2 whose shape changes only on musical events and which sparkles on percussive hits); unchanged max extent/power')
     audio.add_argument('--ripple-depth', type=float, default=.07,
                        help='radial deformation fraction per packet, 0..0.10 (default .07); reserves matching inward headroom, never boosts power')
     audio.add_argument('--ripple-frequency', type=int, default=5,
