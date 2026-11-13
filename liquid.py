@@ -235,13 +235,18 @@ class BeatRings:
         is born, and a small proportional pull toward the PLL-derived ideal fraction
         keeps it phase-locked without visible speed jumps when the tempo estimate moves;
     Unlocked: rings follow flux/bass onsets with a fixed lifetime, and a slow idle ring
-    is born whenever none has been seen for IDLE_GAP seconds, so rings never stop.
+    is born whenever none has been seen for IDLE_GAP seconds while music plays.
+    Silence (activity below SIG_ON/SIG_OFF, with hysteresis) births nothing on any path;
+    a ring already in flight still finishes, and the first ring after silence comes
+    with the music (the spawn timer is reset on the silence->signal edge).
     """
     LOCK_ON = 0.25
     LOCK_OFF = 0.12
     FREE_LIFE = 1.35
     IDLE_LIFE = 2.4
     IDLE_GAP = 1.0
+    SIG_ON = 0.06           # activity above which there is music to answer
+    SIG_OFF = 0.03          # ...and below which it is silence again (room floor sits at ~0)
     RATE_TAU = 0.45
     PHASE_GAIN = 1.2
     MIN_LIFE = 0.75         # a ring spans 1/2/4 beats; double up while a ring would live < MIN_LIFE s
@@ -254,6 +259,7 @@ class BeatRings:
         self.last_spawn_cycle = 0
         self.last_spawn_time = -1e9
         self.locked = False
+        self.signal = False
         self.beats = 1
         self.rate = 1.0 / self.FREE_LIFE
         self.ring = None   # dict: frac, color, kind, life, beats, theta0
@@ -289,9 +295,19 @@ class BeatRings:
             self.beats *= 2
         while self.beats > 1 and (self.beats // 2) * beat_period >= self.MAX_LIFE:
             self.beats //= 2
+        # --- signal gate (hysteresis): no audio, no new rings ---
+        was_signal = self.signal
+        self.signal = act > (self.SIG_OFF if was_signal else self.SIG_ON)
+        if self.signal and not was_signal:
+            # first ring arrives with the music: onsets may fire at once, and the idle
+            # fallback waits only 0.25 s (activity crosses SIG_ON a frame or two before
+            # the kick itself clears the onset threshold, so idle must not pre-empt it)
+            self.last_spawn_time = now - (self.IDLE_GAP - 0.25)
         # --- spawn ---
         spawned_on_beat = False
-        if self.locked and wrapped and cycle - self.last_spawn_cycle >= self.beats:
+        if not self.signal:
+            pass
+        elif self.locked and wrapped and cycle - self.last_spawn_cycle >= self.beats:
             ideal0 = (self.theta - TWO_PI * cycle) / (TWO_PI * self.beats)
             self._spawn('beat', now, color, None, theta0=TWO_PI * cycle,
                         frac0=min(0.25, max(0.0, ideal0)))

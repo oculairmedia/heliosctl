@@ -216,6 +216,50 @@ class BeatRingTests(unittest.TestCase):
         self.assertLess(c.morph_clock, 8 * math.pi + 1e-9)
 
 
+class SilenceTests(unittest.TestCase):
+    """No audio -> no rings.  A ring is a response to music, never to elapsed time."""
+    def test_pure_silence_spawns_no_rings(self):
+        # Full chain as heliosctl drives it: Bands on digital silence feeds LiquidContour.
+        b, c, now, dt = Bands(), LiquidContour(), 0., .025
+        for _ in range(int(10 / dt)):
+            now += dt
+            bands = [math.sqrt(min(1., max(0., v))) for v in b.update([0] * 320, dt)]
+            c.sample(.0, bands, now, dt, .07, 5, flux=b.flux, sub_flux=b.sub_flux, beat_phase=b.beat_phase,
+                     beat_lock=b.beat_lock, activity=b.activity, beat_period=b.beat_period)
+        self.assertEqual(c.rings.spawned, {'beat': 0, 'onset': 0, 'idle': 0})
+        # BeatRings alone, even with a stale 'locked' PLL still spinning: silence never spawns.
+        r = BeatRings()
+        for i in range(400):
+            r.update(i * dt, dt, (i * dt * 2 * math.pi / .5) % (2 * math.pi), .5, .9 if i < 40 else 0., 0., False, (1, 2, 3))
+        self.assertEqual(r.spawned, {'beat': 0, 'onset': 0, 'idle': 0})
+
+    def test_onset_after_long_silence_spawns_promptly(self):
+        c, now, dt = LiquidContour(), 0., .025
+        for _ in range(int(10 / dt)):
+            now += dt
+            c.sample(.0, [0., 0., 0.], now, dt, .07, 5, activity=0.)
+        self.assertEqual(sum(c.rings.spawned.values()), 0)
+        now += dt
+        c.sample(.4, [.8, .3, .1], now, dt, .07, 5, sub_flux=(.7, .1, .1), activity=.6)
+        self.assertEqual(c.rings.spawned['onset'], 1)       # born on the very first loud frame
+        self.assertIsNotNone(c.rings.ring)
+
+    def test_ring_in_flight_finishes_through_brief_dropout(self):
+        r, dt = BeatRings(), .025
+        r.update(0., dt, 0., .5, 0., .6, True, (1, 2, 3))
+        ring = r.ring
+        self.assertIsNotNone(ring)
+        fracs = []
+        for i in range(1, 30):                      # 0.7 s of silence right after the birth
+            r.update(i * dt, dt, 0., .5, 0., 0., False, (1, 2, 3))
+            if r.ring is not ring:
+                break
+            fracs.append(ring['frac'])
+        self.assertGreater(len(fracs), 20)          # not cut dead mid-flight
+        self.assertEqual(fracs, sorted(fracs))      # keeps expanding
+        self.assertEqual(sum(r.spawned.values()), 1)  # but nothing new is born
+
+
 class FrameBlankingTests(unittest.TestCase):
     """The core->ring transit and the ring->core walk-back must be dark *and* settled.
 
