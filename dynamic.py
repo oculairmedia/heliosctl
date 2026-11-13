@@ -174,7 +174,7 @@ class DynamicContour(LiquidContour):
         def ring_radius(ang):
             w_ring = (0.12 * bass * np.sin(2 * ang - self.phase) + 0.07 * mid * np.sin(3 * ang + self.phase)
                       + 0.06 * self.twist * np.sin(2 * ang + 2 * self.phase))
-            r = 1.0 + (0.0 if ghost else 0.05 * np.tanh(w_ring) * min(1.0, 2.0 * fade))
+            r = np.ones_like(ang) + (0.0 if ghost else 0.05 * np.tanh(w_ring) * min(1.0, 2.0 * fade))
             if style == 'burst':
                 r = r + shell * np.real(self.imprint @ np.exp(1j * np.outer(modes, ang)))
             elif style == 'scallop':
@@ -226,6 +226,10 @@ class DynamicContour(LiquidContour):
             rot = (1.5 if style == 'burst' else -2.0) * self.phase / TWO_PI
             u = (ring_a * n_dash / TWO_PI + rot) % 1.0
             ring_blank[1:-1] = (u[1:-1] >= duty) & (white < 0.5)   # born solid, breaks into dashes
+            # the ring's first and last few points stay lit, so the dashes never merge with the
+            # transit's blank run (whose dwell and settle points must stay identical)
+            ring_blank[1:1 + DWELL_ON + 1] = False
+            ring_blank[-(DWELL_OFF + 3):-1] = False
         ring_blank[0] = ring_blank[-1] = True
         ring_rgb[ring_blank] = 0
         ring_cols = [tuple(c) for c in ring_rgb.tolist()]
