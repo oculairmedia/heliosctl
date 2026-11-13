@@ -94,14 +94,24 @@ class LiquidTests(unittest.TestCase):
             for j in range(1, 219):
                 p, q, r = coords[j], coords[j + 1], coords[j - 1]
                 max_curve = max(max_curve, math.hypot(q[0]-2*p[0]+r[0], q[1]-2*p[1]+r[1]))
-            # Check concentric ring segments if present
-            if len(coords) >= 442:
-                for j in range(219):
-                    p, q = coords[222 + j], coords[222 + j + 1]
+            # Check every other drawn curve (ring, or body retrace) wherever it sits in the
+            # frame: each lit run plus its blank seam neighbours, exactly as the core above.
+            # (The ring no longer has a fixed 222..441 slot: it yields points to the eased
+            # blank transits, which FrameBlankingTests bounds separately.)
+            j = 220
+            while j < len(coords):
+                if blanks[j]:
+                    j += 1
+                    continue
+                k = j
+                while k < len(coords) and not blanks[k]:
+                    k += 1
+                run = coords[j - 1:k + 1]          # lit run with its seam neighbours
+                for p, q in zip(run, run[1:]):
                     max_segment = max(max_segment, math.dist(p, q))
-                for j in range(1, 219):
-                    p, q, r = coords[222 + j], coords[222 + j + 1], coords[222 + j - 1]
+                for r, p, q in zip(run, run[1:], run[2:]):
                     max_curve = max(max_curve, math.hypot(q[0]-2*p[0]+r[0], q[1]-2*p[1]+r[1]))
+                j = k
         self.assertLess(max_segment, 225)
         self.assertLess(max_curve, 15)
         print('concentric liquid max segment/curvature ILDA:', max_segment, max_curve)
@@ -204,6 +214,60 @@ class BeatRingTests(unittest.TestCase):
             self.assertLess(v, 2 * math.pi + 1e-9)
         self.assertLess(c.tilt_phase, 20 * math.pi + 1e-9)
         self.assertLess(c.morph_clock, 8 * math.pi + 1e-9)
+
+
+class FrameBlankingTests(unittest.TestCase):
+    """The core->ring transit and the ring->core walk-back must be dark *and* settled.
+
+    Galvos lag the colour channel: a blanked jump of thousands of ILDA units in one
+    point leaves the mirrors still travelling when the next point is lit, which
+    paints the 'line from the sphere to the ring' seen on the wall.
+    """
+    LIT_STEP = 225       # galvo bound for any segment drawn lit (heliosctl limit)
+    BLANK_STEP = 800     # blank moves are eased over several points, never one jump
+    SETTLE_OFF = 3       # identical blank points before a jump leaves a lit curve
+    SETTLE_ON = 4        # identical blank points at the landing before relighting
+
+    def frames(self, seconds=8, dt=.025, period=.9):
+        c = LiquidContour()
+        phase, now = 0., 0.
+        for _ in range(int(seconds / dt)):
+            phase = (phase + 2 * math.pi * dt / period) % (2 * math.pi)
+            coords, colors, blanks = c.sample(.3, [.6, .4, .3], now, dt, .07, 5, beat_phase=phase,
+                                              beat_lock=.9, activity=.8, beat_period=period)
+            yield coords, colors, blanks, c.rings.ring
+            now += dt
+
+    def test_ring_transit_is_blank_bounded_and_settled(self):
+        n_big = 0
+        for coords, colors, blanks, ring in self.frames():
+            n = len(coords)
+            self.assertEqual(n, 450)
+            steps = [math.dist(coords[i - 1], coords[i]) for i in range(n)]   # cyclic: frame repeats
+            for i in range(n):
+                if not blanks[i]:
+                    # a lit point never ends a long move, and never starts one
+                    self.assertLessEqual(steps[i], self.LIT_STEP, f'lit point {i} reached by a jump')
+                    self.assertLessEqual(steps[(i + 1) % n], self.LIT_STEP, f'lit point {i} starts a jump')
+                else:
+                    self.assertEqual(colors[i], (0, 0, 0))
+                self.assertLessEqual(steps[i], self.BLANK_STEP, f'blank step {i} is a single galvo jump')
+            # every maximal blank run that contains a jump must settle before and after it
+            i = 0
+            while i < n:
+                if blanks[i] and not blanks[i - 1]:
+                    j = i
+                    while blanks[j % n]:
+                        j += 1
+                    run = [coords[k % n] for k in range(i, j)]
+                    jump = max(math.dist(p, q) for p, q in zip(run, run[1:])) if len(run) > 1 else 0.
+                    if jump > self.LIT_STEP:
+                        n_big += 1
+                        self.assertGreaterEqual(len(run), self.SETTLE_OFF + self.SETTLE_ON)
+                        self.assertEqual(len(set(run[:self.SETTLE_OFF])), 1, f'no laser-off dwell at {i}')
+                        self.assertEqual(len(set(run[-self.SETTLE_ON:])), 1, f'no galvo settle before relight at {j}')
+                i += 1
+        self.assertGreater(n_big, 50)   # the scenario really exercised ring transits
 
 
 if __name__ == '__main__':

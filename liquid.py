@@ -195,23 +195,32 @@ class Bands:
 
 TWO_PI = 2.0 * math.pi
 N_CORE = 220            # twist body points (indices 0..219, seam closes 0 == 219)
-N_RING = 220            # one expanding ring (indices 222..441 when drawn)
+N_RING = 220            # max points for one expanding ring (actual count shrinks as transits grow)
 N_FRAME = 450           # constant frame size: 22.5 ms @ 20 kpps = 44.4 Hz refresh
+DWELL_OFF = 2           # extra blank repeats of the last curve point before a jump (laser-off latency)
+DWELL_ON = 3            # blank repeats at a landing point before relighting (galvo settle)
+BLANK_STEP = 760.0      # max ILDA step of an eased blank move (smoothstep peak ~1.5x mean)
 FOLD_OCTAVES = 3
 GRAD_MAX = 0.20
 CURL_GAIN = 0.012       # shape contribution of the curl noise (psi itself still drives the 4D fold gradient)
 FOLD_GAIN = 1.0         # peak 4D fold angle = FOLD_GAIN*2 rad*grad (tuned against curvature bound)
-RING_R_MAX = 7200.0     # keeps ring chord spacing (2*pi*r/219) under the 225-unit segment bound
+RING_R_MAX = 6600.0     # with transits taking ~30 pts, keeps ring chord spacing under the 225-unit bound
 _A = np.linspace(0.0, TWO_PI, N_CORE)
 _COS_A = np.cos(_A)
 _SIN_A = np.sin(_A)
-_RING_A = np.linspace(0.0, TWO_PI, N_RING)
-_RING_COS = np.cos(_RING_A)
-_RING_SIN = np.sin(_RING_A)
 
 
 def _wrap_pi(x):
     return math.atan2(math.sin(x), math.cos(x))
+
+
+def _blank_move(a, b):
+    """Eased (smoothstep) blank path from a (exclusive) to b (inclusive); every step <= BLANK_STEP."""
+    d = math.dist(a, b)
+    n = max(1, math.ceil(1.5 * d / BLANK_STEP))
+    t = np.arange(1, n + 1) / n
+    e = t * t * (3.0 - 2.0 * t)
+    return [(round(a[0] + (b[0] - a[0]) * u), round(a[1] + (b[1] - a[1]) * u)) for u in e.tolist()]
 
 
 class BeatRings:
@@ -320,8 +329,8 @@ class BeatRings:
 class LiquidContour:
     """Twist-sphere body (torsion-spring twist, curl-noise octaves, 4D fold) with one
     BPM-locked expanding ring (see BeatRings).  Every frame is exactly N_FRAME points
-    (core 220 + transit 2 + ring 220 + blank walk-back, or core twice when no ring is
-    visible) so the DAC refresh stays ~44 Hz at 20 kpps and brightness stays even.
+    (core 220 + dwell/eased-blank transit + ring (<=220, it yields points to longer
+    transits) + dwell/eased walk-back, or core twice when no ring is visible) so the DAC refresh stays ~44 Hz at 20 kpps and brightness stays even.
     """
     MODES = ((2, 3), (3, 4), (2, 4), (1, 3))
 
@@ -507,29 +516,36 @@ class LiquidContour:
             r0 = 1.18 * r_core
             rw = r0 + (RING_R_MAX - r0) * frac
             col = ring['color']
-            w_ring = (0.12 * bass * np.sin(2 * _RING_A - self.phase) + 0.07 * mid * np.sin(3 * _RING_A + self.phase)
-                      + 0.06 * self.twist * np.sin(2 * _RING_A + 2 * self.phase))
-            r_ring = rw * (1.0 + 0.10 * np.tanh(w_ring) * min(1.0, 2.0 * fade))
-            rx = np.rint(r_ring * _RING_COS).astype(np.int64)
-            ry = np.rint(r_ring * _RING_SIN).astype(np.int64)
+            # Transit out and walk back cover the same radial gap at angle 0: dwell, eased
+            # blank move, settle -- the mirrors must stop before the laser relights, or the
+            # beam paints the jump (the 'line from the sphere to the ring').
+            def ring_radius(ang):
+                w_ring = (0.12 * bass * np.sin(2 * ang - self.phase) + 0.07 * mid * np.sin(3 * ang + self.phase)
+                          + 0.06 * self.twist * np.sin(2 * ang + 2 * self.phase))
+                return rw * (1.0 + 0.10 * np.tanh(w_ring) * min(1.0, 2.0 * fade))
+            seam = coords[-1]
+            land = (int(np.rint(ring_radius(np.zeros(1))[0])), 0)
+            out = _blank_move(seam, land)
+            back = _blank_move(land, coords[0])     # same gap (core seam == coords[0]): same length
+            n_ring = min(N_RING, N_FRAME - N_CORE - 2 * (DWELL_OFF + DWELL_ON) - len(out) - len(back))
+            ring_a = np.linspace(0.0, TWO_PI, n_ring)
+            r_ring = ring_radius(ring_a)
+            rx = np.rint(r_ring * np.cos(ring_a)).astype(np.int64)
+            ry = np.rint(r_ring * np.sin(ring_a)).astype(np.int64)
             rpts = list(zip(rx.tolist(), ry.tolist()))
-            rpts[-1] = rpts[0]
-            coords.append(coords[-1]); colors.append((0, 0, 0)); blanks.append(True)
-            coords.append(rpts[0]); colors.append((0, 0, 0)); blanks.append(True)
+            rpts[0] = rpts[-1] = land
+            dark = [seam] * DWELL_OFF + out + [rpts[0]] * DWELL_ON
             lit = (int(col[0] * fade), int(col[1] * fade), int(col[2] * fade))
-            for j, p in enumerate(rpts):
-                blank = j in (0, N_RING - 1)
-                coords.append(p)
-                colors.append((0, 0, 0) if blank else lit)
-                blanks.append(blank)
-            # blanked walk back to the core seam (never one long jump)
-            walk = N_FRAME - len(coords)
-            ex, ey = rpts[-1]
-            sx, sy = coords[0]
-            for s in range(1, walk + 1):
-                t = s / walk
-                coords.append((round(ex + (sx - ex) * t), round(ey + (sy - ey) * t)))
-                colors.append((0, 0, 0)); blanks.append(True)
+            ring_cols = [lit] * n_ring
+            ring_cols[0] = ring_cols[-1] = (0, 0, 0)
+            ring_blank = [False] * n_ring
+            ring_blank[0] = ring_blank[-1] = True
+            tail = [rpts[-1]] * DWELL_OFF + back
+            pad = N_FRAME - len(coords) - len(dark) - n_ring - len(tail)
+            tail += [coords[0]] * pad          # settle on the core seam (== DWELL_ON points)
+            coords += dark + rpts + tail
+            colors += [(0, 0, 0)] * len(dark) + ring_cols + [(0, 0, 0)] * len(tail)
+            blanks += [True] * len(dark) + ring_blank + [True] * len(tail)
         else:
             # No visible ring: retrace the body so lit duty and refresh stay constant.
             coords.extend(coords[1:N_CORE]); colors.extend(colors[1:N_CORE]); blanks.extend(blanks[1:N_CORE])
