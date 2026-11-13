@@ -140,7 +140,12 @@ class DynamicContour(LiquidContour):
             return 'spiral' if ring['color'] == (110, 220, 255) else 'dash'
         return 'ghost'
 
-    def _append_ring(self, coords, colors, blanks, pts, r_core, bass, mid, act):
+    def _append_ring(self, coords, colors, blanks, pts, r_core, bass, mid, act, budget=N_FRAME):
+        """Ring or body retrace so the frame is exactly `budget` points (N_FRAME by default).
+        A caller that needs points for something else (liquid3's sparks) passes a smaller
+        budget: the ring then yields them as an *open arc* drawn at the same chord spacing a
+        full ring would have, so the missing sector costs no segment length or curvature,
+        and the walk-back starts from the arc's end."""
         ring = self.rings.ring
         fade = 0.0
         if ring is not None:
@@ -149,7 +154,7 @@ class DynamicContour(LiquidContour):
             fade *= 0.6 + 0.4 * ring.get('weight', 1.0)
         if ring is None or fade < 0.03:
             coords.extend(coords[1:N_CORE]); colors.extend(colors[1:N_CORE]); blanks.extend(blanks[1:N_CORE])
-            while len(coords) < N_FRAME:
+            while len(coords) < budget:
                 coords.append(coords[0]); colors.append((0, 0, 0)); blanks.append(True)
             return
         r0 = 1.18 * r_core
@@ -192,7 +197,22 @@ class DynamicContour(LiquidContour):
         out = _blank_move(seam, land)
         back = _blank_move(last, coords[0])
         n_ring = min(N_RING, N_FRAME - N_CORE - 2 * (DWELL_OFF + DWELL_ON) - len(out) - len(back))
-        ring_a = np.linspace(0.0, TWO_PI, n_ring)
+        arc = TWO_PI
+        if budget < N_FRAME:
+            # open arc: keep the full ring's chord (same angular step), drop the sector at the
+            # end; the longer walk-back from the arc's end is paid out of the same budget
+            n_full = n_ring
+            n_ring = min(N_RING, budget - N_CORE - 2 * (DWELL_OFF + DWELL_ON) - len(out) - len(back))
+            for _ in range(8):      # a shorter arc ends farther from the seam: shrink until it fits
+                arc = TWO_PI * (n_ring - 1) / (n_full - 1)
+                last = tuple(int(v) for v in np.rint(ring_radius(np.full(1, arc))[0]
+                                                     * np.array((math.cos(th0 + arc), math.sin(th0 + arc)))))
+                back = _blank_move(last, coords[0])
+                n_ok = min(N_RING, budget - N_CORE - 2 * (DWELL_OFF + DWELL_ON) - len(out) - len(back))
+                if n_ok >= n_ring:
+                    break
+                n_ring = n_ok
+        ring_a = np.linspace(0.0, arc, n_ring)
         r_ring = ring_radius(ring_a)
         rx = np.rint(r_ring * np.cos(ring_a + th0)).astype(np.int64)
         ry = np.rint(r_ring * np.sin(ring_a + th0)).astype(np.int64)
@@ -234,7 +254,7 @@ class DynamicContour(LiquidContour):
         ring_rgb[ring_blank] = 0
         ring_cols = [tuple(c) for c in ring_rgb.tolist()]
         tail = [rpts[-1]] * DWELL_OFF + back
-        pad = N_FRAME - len(coords) - len(dark) - n_ring - len(tail)
+        pad = budget - len(coords) - len(dark) - n_ring - len(tail)
         tail += [coords[0]] * pad
         coords += dark + rpts + tail
         colors += [(0, 0, 0)] * len(dark) + ring_cols + [(0, 0, 0)] * len(tail)
