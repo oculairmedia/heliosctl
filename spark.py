@@ -44,8 +44,10 @@ HIT_RISE = 0.6           # ...and some raw band energy must rise by this fractio
 HIT_MIN_JUMP = 0.003     # ...and by this much in absolute terms (a hat under a decaying kick still counts)
 HIT_MIN_ACT = 0.08
 REFRACTORY = {'kick': 0.10, 'snare': 0.10, 'hat': 0.07, 'stab': 0.15}   # s, per kind
-SURPRISE = 1.3           # a hit this much above the recent hit reference is an event (morph)
-HIT_REF_TAU = 6.0        # max-hold decay of the hit reference, s
+SURPRISE = 2.0           # a hit this much above its kind's recent median is an event (morph); within a
+                         # steady passage a kind's jumps stay within ~1.6x of their median (split blocks go
+                         # lower, never higher), section entries are 3.7-10x
+HIT_HIST = 8             # jumps per kind the reference median is taken over (needs 4 to judge)
 FILL_HITS, FILL_WINDOW = 4, 1.0     # >= 4 snare/stab hits within a beat (<= 1 s) is a fill
 # --- morph events ---
 MORPH_GAP = 0.30         # least time between two morph starts, s
@@ -81,8 +83,8 @@ class SparkContour(DynamicContour):
         self.last_hit = {k: -1e9 for k in KINDS}
         self.hits = []                  # (kind, strength) detected on this frame
         self.hit_count = {k: 0 for k in KINDS}
-        self.hit_ref = 0.0              # max-hold of hit strength (the ordinary hit)
-        self.hit_ref_since = None       # when the reference started (surprise needs history)
+        self.hit_hist = {k: [] for k in KINDS}   # recent energy jumps per kind: the ordinary hit of this passage
+        self.hit_ref_since = None       # when the first hit was seen (surprise needs history)
         self.snare_times = []
         self.last_fill = -1e9
         self.prev_acc = 0.0
@@ -142,16 +144,16 @@ class SparkContour(DynamicContour):
             energy = bands                  # no raw energies (tests, previews): the envelopes stand in
         self.hits = []
         kind, jump = self._classify(energy, sub_flux, act)
-        self.hit_ref *= math.exp(-self._dt / HIT_REF_TAU)
         if kind is not None and now - self.last_hit[kind] >= REFRACTORY[kind]:
             self.last_hit[kind] = now
             self.hit_count[kind] += 1
-            # strength = this hit's energy jump over the recent hits' max-hold: ~1 for an ordinary
-            # hit of the passage whatever the gain, > 1 for one that stands out
-            strength = jump / self.hit_ref if self.hit_ref > 0.0 else 1.0
+            # strength = this hit's energy jump over the median of its kind's recent jumps: ~1 for
+            # an ordinary hit of the passage whatever the gain, well above 1 for one that stands out
+            hist = self.hit_hist[kind]
+            strength = jump / float(np.median(hist)) if len(hist) >= 4 else 1.0
             if self.hit_ref_since is None:
                 self.hit_ref_since = now
-            self.hit_ref = max(jump, self.hit_ref)
+            self.hit_hist[kind] = (hist + [jump])[-HIT_HIST:]
             self.hits.append((kind, strength))
         self.prev_energy = list(energy)
         return super().sample(level, bands, now, dt, *args, **kw)
