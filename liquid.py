@@ -680,9 +680,18 @@ class LiquidContour:
         psi = self._oct_a[:FOLD_OCTAVES] @ np.sin(arg[:FOLD_OCTAVES])
         wave = low_amp * w_low + mid_amp * w_mid + fine_amp * w_hat + imp_gain * splash + curl
         mod = 1.0 + 0.14 * np.tanh(1.5 * wave)
-        x0 = _COS_A * mod + 0.045 * wave * _COS_A
-        y0 = _SIN_A * mod + 0.045 * wave * _SIN_A
-        z0 = 0.09 * wave
+        fig = self._figure(now, step_dt, act, accent, beat_period, on_beat)
+        if fig is None:
+            x0 = _COS_A * mod + 0.045 * wave * _COS_A
+            y0 = _SIN_A * mod + 0.045 * wave * _SIN_A
+            z0 = 0.09 * wave
+        else:
+            # A variant figure (dynamic.py): the radial wave scales the figure about the
+            # origin and the z wave rides on the figure's own depth.
+            fx, fy, fz = fig
+            x0 = fx * (mod + 0.045 * wave)
+            y0 = fy * (mod + 0.045 * wave)
+            z0 = fz + 0.09 * wave
         # 4D fold: per-point gradient from the curl-noise potential, scaled by how
         # wound the torsion spring is; only part of the ring sweeps through W.
         g = np.clip(psi * 0.62, 0.0, 1.0)
@@ -741,6 +750,17 @@ class LiquidContour:
         colors[0] = colors[-1] = (0, 0, 0)
 
         # --- ring (one at a time, expansion fraction from BeatRings) ---
+        self._append_ring(coords, colors, blanks, pts, r_core, bass, mid, act)
+        self.colors = colors
+        return coords, colors, blanks
+
+    def _figure(self, now, step_dt, act, accent, beat_period, on_beat):
+        """Base figure hook: None = the unit circle (the twist sphere).  A variant returns
+        (x, y, z) arrays over _A, unit scale, closed (index 0 == index N_CORE-1)."""
+        return None
+
+    def _append_ring(self, coords, colors, blanks, pts, r_core, bass, mid, act):
+        """Append the ring (or the body retrace) so the frame is exactly N_FRAME points."""
         ring = self.rings.ring
         fade = 0.0
         if ring is not None:
@@ -808,5 +828,3 @@ class LiquidContour:
             coords.extend(coords[1:N_CORE]); colors.extend(colors[1:N_CORE]); blanks.extend(blanks[1:N_CORE])
             while len(coords) < N_FRAME:
                 coords.append(coords[0]); colors.append((0, 0, 0)); blanks.append(True)
-        self.colors = colors
-        return coords, colors, blanks
