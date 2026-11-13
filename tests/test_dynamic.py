@@ -206,6 +206,20 @@ class RingStyleTests(unittest.TestCase):
         self.assertEqual(c._style(c.rings.ring), 'dash')
         self.assertEqual(c._style({'kind': 'idle', 'color': (110, 220, 255), 'weight': 1.}), 'ghost')
 
+    def test_idle_ghost_rings_render_and_are_blank_safe(self):
+        # unlocked, quiet, no onsets: BeatRings' idle path births ghost rings; every frame drawn
+        c = DynamicContour(); ghost_frames = 0
+        for now, (coords, colors, blanks) in locked_frames(c, .6, [.15, .1, .05], .3, 0., 8, lock=0.):
+            self.assertEqual(len(coords), 450)
+            assert_blank_transits_settled(self, coords, blanks, colors)
+            seg, curv, blank, lit = lit_runs_metrics(coords, blanks)
+            self.assertLess(seg, 225); self.assertLess(curv, 15)
+            if c.rings.ring is not None and c.ring_obj is c.rings.ring and c.ring_style == 'ghost':
+                ghost_frames += 1
+        self.assertGreater(c.rings.spawned['idle'], 2)
+        self.assertEqual(c.rings.spawned['beat'] + c.rings.spawned['onset'], 0)
+        self.assertGreater(ghost_frames, 40)
+
     def test_beat_lock_and_ring_births_identical_to_liquid_on_the_real_chain(self):
         """The variant changes only the drawing: Bands and BeatRings are shared, so the
         beat lock and every ring birth are identical to --pattern liquid."""
