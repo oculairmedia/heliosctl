@@ -581,6 +581,7 @@ class LiquidContour:
         self.ring_obj = None        # identity of the ring being drawn (to catch births)
         self.ring_hue = 0.0         # palette walk: each new ring steps by the golden angle
         self.imprint = np.zeros(IMPRINT_MODES, dtype=np.complex128)   # body outline shed into the ring
+        self.guard_hits = 0         # frames on which the curvature guard below had to shrink the body
 
     def sample(self, level, bands, now, dt, depth=.07, frequency=8, flux=0., centroid=.25, pitch_angle=None,
                sub_flux=None, beat_phase=0., hat_phase=0., beat_lock=0., hat_lock=0., activity=None,
@@ -724,6 +725,7 @@ class LiquidContour:
             curv = float(np.max(np.hypot(*(core[2:] - 2 * core[1:-1] + core[:-2]).T)))
             if curv <= CURV_MAX:
                 break
+            self.guard_hits += 1
             pts = pts * ((CURV_MAX - 1.0) / curv)
             core = np.rint(pts).astype(np.int64)
         self.previous = pts
