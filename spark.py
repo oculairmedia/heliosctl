@@ -36,7 +36,7 @@ import math
 import random
 import numpy as np
 from dynamic import DynamicContour, MORPH_MIN, MORPH_MAX, SPIN_MAX
-from liquid import _blank_move, N_CORE, N_FRAME, DWELL_OFF, DWELL_ON, RING_R_MAX, TWO_PI
+from liquid import _blank_move, N_CORE, N_FRAME, DWELL_OFF, DWELL_ON, RING_R_MAX, RING_R0, TWO_PI
 
 # --- hit detection ---
 HIT_FLUX = 0.30          # some band's normalised flux must fire...
@@ -72,10 +72,11 @@ KINDS = {
 class SparkContour(DynamicContour):
     # liquid3 *holds* a figure for seconds at a time (liquid2 never did), so a saturated
     # passage stacks the beat punch and the body's splash impulses onto the same figure beat
-    # after beat; 5% smaller figures keep the held body under CURV_MAX so the guard does not
-    # shrink and regrow it by 7% every few beats (that regrow is a body step of ~650 units
-    # between frames).  The guard itself is untouched and still the backstop.
-    FIGURES = [f * 0.95 for f in DynamicContour.FIGURES]
+    # after beat.  The figures used to be drawn 5% smaller than liquid2's so the integer
+    # curvature guard would not shrink and regrow the held body by 7% every few beats; the
+    # continuous pre-limiter in LiquidContour.sample now holds a saturated body at the
+    # ceiling smoothly, so the figures are drawn at full size.
+    FIGURES = DynamicContour.FIGURES
 
     def __init__(self, seed=42):
         super().__init__(seed)
@@ -218,7 +219,7 @@ class SparkContour(DynamicContour):
         ring = self.rings.ring
         rw = None
         if ring is not None:
-            r0 = 1.18 * r_core
+            r0 = RING_R0 * r_core
             rw = r0 + (RING_R_MAX - r0) * ring['frac']
         for kind, strength in self.hits:
             n, life, speed, streak, spread, grav, rgb, bflash, frgb, shatter = KINDS[kind]

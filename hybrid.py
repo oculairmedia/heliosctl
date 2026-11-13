@@ -39,7 +39,7 @@ import math
 import numpy as np
 from dynamic import DynamicContour
 from spark import SparkContour, KINDS, SPARK_STEP_MAX, SPARK_R_MAX, SHATTER_FRAGS
-from liquid import N_CORE, N_FRAME, DWELL_OFF, DWELL_ON, RING_R_MAX, TWO_PI
+from liquid import N_CORE, N_FRAME, DWELL_OFF, DWELL_ON, RING_R_MAX, RING_R0, TWO_PI
 
 # 1 / 6 sparks
 INHERIT = 1.0            # share of the local body velocity a spark leaves with
@@ -134,7 +134,7 @@ class HybridContour(SparkContour):
         ring = self.rings.ring
         rw = None
         if ring is not None:
-            r0 = 1.18 * r_core
+            r0 = RING_R0 * r_core
             rw = r0 + (RING_R_MAX - r0) * ring['frac']
         dt = max(1e-3, self._dt)
         pv = self._prev_pts if self._prev_pts is not None and len(self._prev_pts) == len(pts) else None
@@ -236,7 +236,7 @@ class HybridContour(SparkContour):
         if ring is None or fade < 0.03 or now - self.last_trail < TRAIL_EVERY:
             return
         self.last_trail = now
-        r0 = 1.18 * r_core
+        r0 = RING_R0 * r_core
         rw = r0 + (RING_R_MAX - r0) * ring['frac']
         seam = coords[N_CORE - 1]
         th0 = math.atan2(seam[1], seam[0]) + math.pi - 0.5 * TRAIL_SPAN   # opposite the transit

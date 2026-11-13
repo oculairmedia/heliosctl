@@ -382,11 +382,21 @@ FOLD_OCTAVES = 3
 IMPRINT_MODES = 4       # body outline modes carried out by a ring (higher ones would kink a 200-pt ring)
 IMPRINT_BUDGET = 0.6    # max sum(|a_m| m^2) of the carried outline: <= ~4 units of ring curvature at r 6600
 CURV_MAX = 14.6         # emitted body second-difference ceiling (heliosctl galvo bound 15)
+CURV_TARGET = CURV_MAX - 2.6   # the pre-limiter in `sample` sizes the body to this.  Integer rounding adds at most
+                               # 2*sqrt(2), so the emitted body stays under the galvo bound 15 and the guard
+                               # below should never fire (a guard shrink on top of a blend step pops the body)
+SEG_TARGET = 215.0      # body chord the pre-limiter allows (heliosctl lit-segment bound 225, rounding adds ~1.5)
+R_BODY_MAX = 5000.0     # hard body cap: a ring is born at RING_R0 x body carrying the body outline (up to ~+20%),
+                        # so this keeps the newborn ring chord near 206 and leaves it ~1300 units to expand into
+RING_R0 = 1.12          # a ring is born at this multiple of the body radius (was 1.18, when the body was smaller)
+R_CORE_BASE = 3900.0    # body radius at level 0, before the activity and punch factors (was 2400; the body drew
+R_CORE_LEVEL = 2200.0   # too small on the wall).  Plus this much at level 1 (was 1900).  The curvature
+                        # pre-limiter, not these numbers, is what keeps a loud saturated body legal.
 BEAT_PUNCH = 0.55       # body punch on a beat that earns no ring (a ring birth punches 1.0)
 GRAD_MAX = 0.20
 CURL_GAIN = 0.012       # shape contribution of the curl noise (psi itself still drives the 4D fold gradient)
 FOLD_GAIN = 1.0         # peak 4D fold angle = FOLD_GAIN*2 rad*grad (tuned against curvature bound)
-RING_R_MAX = 6600.0     # with transits taking ~30 pts, keeps ring chord spacing under the 225-unit bound
+RING_R_MAX = 6900.0     # ring chord ~2*pi*R/206 after ~14 transit pts: 210 + imprint ripple stays under the 225 bound
 _A = np.linspace(0.0, TWO_PI, N_CORE)
 _COS_A = np.cos(_A)
 _SIN_A = np.sin(_A)
@@ -678,7 +688,7 @@ class LiquidContour:
         fold = FOLD_GAIN * (1.0 - math.cos(self.rot4d))
 
         amount = depth / .10
-        r_core = (2400.0 + 1900.0 * level) * (0.82 + 0.18 * act) * (1.0 + 0.07 * self.punch * act)
+        r_core = (R_CORE_BASE + R_CORE_LEVEL * level) * (0.82 + 0.18 * act) * (1.0 + 0.07 * self.punch * act)
         c_boost = 0.75 + 0.50 * centroid
         f_boost = 1.0 + 0.40 * max(flux, kick_f)
         low_amp = min(.40 * amount, .34 * amount * (bass + 0.28 * beat_pulse) * f_boost)
@@ -742,7 +752,16 @@ class LiquidContour:
         yr = y0 * math.cos(tx) - z0 * math.sin(tx)
         zr = -x0 * math.sin(ty) + y0 * math.sin(tx) + z0 * math.cos(tx) * math.cos(ty)
         persp = 1.0 / (1.0 - 0.15 * np.clip(zr, -0.8, 0.8))
-        pts = np.stack((r_core * xr * persp, r_core * yr * persp), axis=1)
+        ux, uy = xr * persp, yr * persp
+        # Curvature pre-limiter: the emitted second difference is r_core times that of the
+        # unit shape, so draw the body as large as the budget allows and no larger.  Quiet
+        # and ordinary passages (small wave) get the full r_core; a loud saturated passage,
+        # whose wave already spends most of the budget, sits at the ceiling instead of being
+        # shrunk and regrown by the integer guard below every few frames.
+        kappa = float(np.max(np.hypot(ux[2:] - 2.0 * ux[1:-1] + ux[:-2], uy[2:] - 2.0 * uy[1:-1] + uy[:-2])))
+        chord = float(np.max(np.hypot(np.diff(ux), np.diff(uy))))
+        r_core = min(r_core, R_BODY_MAX, CURV_TARGET / max(1e-9, kappa), SEG_TARGET / max(1e-9, chord))
+        pts = np.stack((r_core * ux, r_core * uy), axis=1)
         if self.previous is not None:
             movement = float(np.max(np.hypot(*(pts - self.previous).T)))
             blend = min(1.0, min(560.0, 22400.0 * max(dt, 0.01)) / max(1e-9, movement))
@@ -801,7 +820,7 @@ class LiquidContour:
             fade = max(0.0, 1.0 - frac ** 1.8) * (0.35 + 0.65 * act)   # holds its light, dies at the edge
             fade *= 0.6 + 0.4 * ring.get('weight', 1.0)                 # floor rings are softer than accents
         if ring is not None and fade >= 0.03:
-            r0 = 1.18 * r_core
+            r0 = RING_R0 * r_core
             rw = r0 + (RING_R_MAX - r0) * frac
             if ring is not self.ring_obj:
                 # A new ring: next palette colour, and freeze the body's current low-order

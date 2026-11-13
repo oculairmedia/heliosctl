@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import heliosctl as h
-from liquid import Bands, BeatRings, LiquidContour
+from liquid import Bands, BeatRings, LiquidContour, R_CORE_BASE, R_CORE_LEVEL
 
 
 def tone(hz, amplitude=.12):
@@ -61,7 +61,7 @@ class LiquidTests(unittest.TestCase):
                         self.assertTrue(0 <= p.r <= 255 and 0 <= p.g <= 255 and 0 <= p.b <= 255)
                 self.assertGreater(len({(p.r, p.g, p.b) for p in native if p.i}), 20)
                 final.append([(p.x, p.y) for p in native])
-            r_base = (2400.0 + 1900.0 * f.geometry)
+            r_base = (R_CORE_BASE + R_CORE_LEVEL * f.geometry)
             radii = [math.hypot(p.x*16-32768, p.y*16-32768) / r_base
                      for p in native[1:219]]
             self.assertGreater(max(radii) - min(radii), (.03, .015, .003)[index])

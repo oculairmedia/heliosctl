@@ -22,7 +22,7 @@ fold, BPM-locked earned rings, galvo guard) and replaces two hooks:
 import math
 import numpy as np
 from liquid import (LiquidContour, _A, _COS_A, _SIN_A, _blank_move, N_CORE, N_RING, N_FRAME,
-                    DWELL_OFF, DWELL_ON, RING_R_MAX, IMPRINT_MODES, IMPRINT_BUDGET, TWO_PI)
+                    DWELL_OFF, DWELL_ON, RING_R_MAX, RING_R0, IMPRINT_MODES, IMPRINT_BUDGET, TWO_PI)
 
 SPIN_MAX = 1.3          # rad/s rigid spin of the figure (rotation preserves segment and curvature)
 MORPH_MIN, MORPH_MAX = 0.18, 0.34   # morph duration bounds, s (0.55 x beat period in between)
@@ -32,10 +32,13 @@ SCALLOP_M, SCALLOP_A = 5, 0.025     # floor-ring ripple: mode 5 at 2.5% adds ~3.
 
 def _unit_figures():
     """Closed figures over _A, normalised to max radius 1, then sized by their curvature
-    load L (max second difference relative to the unit circle's): size = min(1, 4/(3+L)).
+    load L (max second difference relative to the unit circle's): size = min(1, 4/(2.5+L)).
     The twist body at saturated input spends the whole CURV_MAX budget on the sphere
     (~3 parts wave to 1 part circle), so a figure with load L is drawn at that size to
-    keep r*(3*size + L*size) within the same budget; the guard in `sample` is the backstop.
+    roughly keep r*(3*size + L*size) within the same budget.  The constant was 3.0; it was
+    loosened to 2.5 (torus/eight/clover/limacon 0.79/0.78/0.77/0.73 -> 0.87/0.87/0.86/0.80)
+    when the body grew, because `sample` now pre-limits the drawn radius to the curvature
+    budget continuously, so the figures no longer have to carry the whole safety margin.
     A (2,3) torus-knot trefoil was tried and dropped: two windings on 220 points give it
     load 7 (40% size) and double the chord length.  Order: sphere, torus, eight, clover, limacon."""
     a = _A
@@ -53,7 +56,7 @@ def _unit_figures():
         p[-1] = p[0]
         p /= float(np.max(np.hypot(p[:, 0], p[:, 1])))
         load = float(np.max(np.hypot(*(p[2:, :2] - 2 * p[1:-1, :2] + p[:-2, :2]).T))) / kappa_circle
-        size = min(1.0, 4.0 / (3.0 + load))
+        size = min(1.0, 4.0 / (2.5 + load))
         out.append(p * size); names.append(name); sizes.append(size)
     return names, out, sizes
 
@@ -157,7 +160,7 @@ class DynamicContour(LiquidContour):
             while len(coords) < budget:
                 coords.append(coords[0]); colors.append((0, 0, 0)); blanks.append(True)
             return
-        r0 = 1.18 * r_core
+        r0 = RING_R0 * r_core
         rw = r0 + (RING_R_MAX - r0) * frac
         if ring is not self.ring_obj:
             self.ring_obj = ring
