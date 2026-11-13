@@ -186,7 +186,7 @@ class DynamicContour(LiquidContour):
             if style == 'burst':
                 r = r + shell * np.real(self.imprint @ np.exp(1j * np.outer(modes, ang)))
             elif style == 'scallop':
-                r = r + SCALLOP_A * shell * np.cos(SCALLOP_M * ang + 3.0 * self.phase)
+                r = r + SCALLOP_A * shell * np.cos(SCALLOP_M * ang)   # static scallop
             elif style == 'spiral':
                 r = r * (1.0 - 0.16 * (1.0 - ang / TWO_PI))      # free start inside, lands on the full radius
             return rw * r
@@ -228,7 +228,7 @@ class DynamicContour(LiquidContour):
             hue = self.ring_hue + 1.1 * np.cos(ring_a - 1.5 * self.phase)
             white = math.exp(-frac / 0.09)
         elif style == 'scallop':
-            hue = self.ring_hue + 0.5 * np.cos(SCALLOP_M * ring_a + 3.0 * self.phase)
+            hue = self.ring_hue + 0.5 * np.cos(SCALLOP_M * ring_a)   # static hue
         elif style == 'spiral':
             hue = self.ring_hue + 2.0 * ring_a / TWO_PI               # hue travels along the spiral
         elif style == 'dash':
@@ -246,7 +246,7 @@ class DynamicContour(LiquidContour):
             # dashes: blank points in place (no coordinate jump, so no dwell is needed); the
             # pattern rotates with the body phase, against it for a snare dash ring
             n_dash, duty = (8, 0.78) if style == 'burst' else (6, 0.66)
-            rot = (1.5 if style == 'burst' else -2.0) * self.phase / TWO_PI
+            rot = 0.0      # static: the ring must not turn with the body
             u = (ring_a * n_dash / TWO_PI + rot) % 1.0
             ring_blank[1:-1] = (u[1:-1] >= duty) & (white < 0.5)   # born solid, breaks into dashes
             # the ring's first and last few points stay lit, so the dashes never merge with the

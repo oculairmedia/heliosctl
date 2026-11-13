@@ -691,9 +691,9 @@ class LiquidContour:
         r_core = (R_CORE_BASE + R_CORE_LEVEL * level) * (0.82 + 0.18 * act) * (1.0 + 0.07 * self.punch * act)
         c_boost = 0.75 + 0.50 * centroid
         f_boost = 1.0 + 0.40 * max(flux, kick_f)
-        low_amp = min(.40 * amount, .34 * amount * (bass + 0.28 * beat_pulse) * f_boost)
-        mid_amp = min(.26 * amount, .23 * amount * (mid + 0.30 * snare_f) * c_boost)
-        fine_amp = min(.038 * amount, .035 * amount * max(high, hat_sync) * c_boost)
+        low_amp = min(.62 * amount, .56 * amount * (bass + 0.28 * beat_pulse) * f_boost)
+        mid_amp = min(.42 * amount, .38 * amount * (mid + 0.30 * snare_f) * c_boost)
+        fine_amp = min(.065 * amount, .060 * amount * max(high, hat_sync) * c_boost)
         imp_gain = .26 * amount * f_boost * act
         m0_low, m0_mid = self.MODES[self.mode_cur]
         m1_low, m1_mid = self.MODES[self.mode_nxt]
@@ -721,18 +721,18 @@ class LiquidContour:
         # octaves alias into kinks once the fold rotates the ring through W.
         psi = self._oct_a[:FOLD_OCTAVES] @ np.sin(arg[:FOLD_OCTAVES])
         wave = low_amp * w_low + mid_amp * w_mid + fine_amp * w_hat + imp_gain * splash + curl
-        mod = 1.0 + 0.14 * np.tanh(1.5 * wave)
+        mod = 1.0 + 0.26 * np.tanh(1.5 * wave)
         fig = self._figure(now, step_dt, act, accent, beat_period, on_beat)
         if fig is None:
-            x0 = _COS_A * mod + 0.045 * wave * _COS_A
-            y0 = _SIN_A * mod + 0.045 * wave * _SIN_A
+            x0 = _COS_A * mod + 0.085 * wave * _COS_A
+            y0 = _SIN_A * mod + 0.085 * wave * _SIN_A
             z0 = 0.09 * wave
         else:
             # A variant figure (dynamic.py): the radial wave scales the figure about the
             # origin and the z wave rides on the figure's own depth.
             fx, fy, fz = fig
-            x0 = fx * (mod + 0.045 * wave)
-            y0 = fy * (mod + 0.045 * wave)
+            x0 = fx * (mod + 0.085 * wave)
+            y0 = fy * (mod + 0.085 * wave)
             z0 = fz + 0.09 * wave
         # 4D fold: per-point gradient from the curl-noise potential, scaled by how
         # wound the torsion spring is; only part of the ring sweeps through W.

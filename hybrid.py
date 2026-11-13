@@ -351,8 +351,9 @@ class HybridContour(SparkContour):
             frac = ring['frac']
             fade = max(0.0, 1.0 - frac ** 1.8) * (0.35 + 0.65 * act)
             fade *= 0.6 + 0.4 * ring.get('weight', 1.0)
-        ring_visible = ring is not None and fade >= 0.03
-        self._update_trails(coords, r_core, ring, fade)
+        ring_visible = False    # NO_RING: the expanding ring is disabled
+        if False:
+            self._update_trails(coords, r_core, ring, fade)
         # 7: silhouette -- the outline, white, twice, nothing else
         if self.sil_frames > 0:
             self.sil_frames -= 1
