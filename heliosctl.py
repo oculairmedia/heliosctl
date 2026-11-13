@@ -557,7 +557,8 @@ class AudioFrames:
                                                         beat_lock=self.bands.beat_lock,
                                                         hat_lock=self.bands.hat_lock,
                                                         activity=self.bands.activity,
-                                                        beat_period=self.bands.beat_period)
+                                                        beat_period=self.bands.beat_period,
+                                                        accent=self.bands.accent)
             self.onset_count = self.liquid.onsets
         if self.meter and now >= self.next_meter:
             if self.pattern == 'liquid':

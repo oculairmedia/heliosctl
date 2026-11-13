@@ -47,6 +47,18 @@ class Bands:
         self.centroid = .25
         self.pitch_angle = 0.
         self.diagnostic = 'waiting'
+        # accent: how much this moment stands out from the recent past (see _accent)
+        self.loud_now = 0.       # loudness over the last beat (moving average: no beat ripple)
+        self.loud_slow = 0.      # ...and over the last ~10 s (rises in 3 s, falls in 10 s)
+        self.bass_hist = []
+        self.bass_now = 0.
+        self.bass_slow = 0.
+        self.spec_fast = None    # log spectrum over ~0.25 s
+        self.spec_slow = None    # ...and over ~4 s
+        self.nov_base = 0.4      # typical spectral novelty for this track (self-calibrating, starts high)
+        self.peak_hold = 0.      # loudness peak of the last ~kick (decays in 0.25 s)
+        self.peak_ref = 0.       # loudest kick of the last ~10 s (max-hold): a kick far above it is a drop
+        self.accent = 0.
 
     def update(self, samples, dt):
         if len(samples) != 320:
@@ -182,6 +194,8 @@ class Bands:
             herr = math.atan2(math.sin(-self.hat_phase), math.cos(-self.hat_phase))
             self.hat_phase = (self.hat_phase + 0.45 * hat_drive * herr) % (2 * math.pi)
 
+        self._accent(frame_loud, log_spec, dt)
+
         if max(self.energy) > .004:
             raw_c = float(np.dot(np.arange(2, 120), spec320) / (total_power * 60.0))
             self.centroid += (min(1.0, max(0.0, raw_c)) - self.centroid) * (1.0 - math.exp(-dt / 0.08))
@@ -206,6 +220,55 @@ class Bands:
             tau = .016 if target > self.envelope[i] else (.14, .11, .09)[i]
             self.envelope[i] += (target - self.envelope[i]) * (1.0 - math.exp(-dt / tau))
         return self.envelope[:]
+
+    ACCENT_TAU = 0.6                    # peak-hold decay of the accent, s (a beat wrap sees the last half second)
+    ACCENT_DEAD = 0.15                  # residual ripple of the components earns nothing
+
+    def _accent(self, frame_loud, log_spec, dt):
+        """Accent in [0, ~3]: how much the last ~beat stands out from the last ~10 s.
+        0 for anything steady, however loud; positive when the music changes:
+          rise      loudness over ~a beat vs. its 10 s reference (a drop, a build)
+          bass_ret  low band vs. its reference (low end returning after a breakdown)
+          novelty   short vs. long spectral average, relative to the track's typical novelty
+                    (new instruments, a section change, a fill)
+          jump      this kick's peak vs. the loudest kick of the last ~10 s: one-shot and
+                    instant, so the first beat of a drop after a breakdown counts, not the second
+        The 'now' values are moving averages over two beat periods (one kick/snare bar
+        half), so the beat-to-beat ripple of a steady groove cancels instead of being
+        held as an accent.  References
+        adapt up in 3 s and down in 10 s, so a drop reads as an accent for a couple of
+        seconds and then becomes the new normal; a steady groove earns nothing."""
+        up = 1.0 - math.exp(-dt / 3.0)
+        down = 1.0 - math.exp(-dt / 10.0)
+        bass = self.energy[0]
+        self.bass_hist = (self.bass_hist + [bass])[-200:]
+        frame_s = (self.beat_t[-1] - self.beat_t[0]) / (len(self.beat_t) - 1) if len(self.beat_t) > 1 else dt
+        n_beat = max(2, int(round(2.0 * max(0.3, self.beat_period) / max(0.005, frame_s))))
+        self.loud_now = float(np.mean(self.loud_hist[-n_beat:]))
+        self.bass_now = float(np.mean(self.bass_hist[-n_beat:]))
+        if self.loud_slow <= 0.0:                      # first audible frame: no reference yet
+            self.loud_slow, self.bass_slow = self.loud_now, self.bass_now
+        self.loud_slow += (self.loud_now - self.loud_slow) * (up if self.loud_now > self.loud_slow else down)
+        rise = (self.loud_now - self.loud_slow) / max(0.01, self.loud_slow)
+        self.bass_slow += (self.bass_now - self.bass_slow) * (up if self.bass_now > self.bass_slow else down)
+        bass_ret = (self.bass_now - self.bass_slow) / max(0.01, self.bass_slow)
+        if self.spec_slow is None:
+            self.spec_fast = log_spec.copy()
+            self.spec_slow = log_spec.copy()
+        self.spec_fast += (log_spec - self.spec_fast) * (1.0 - math.exp(-dt / 0.25))
+        self.spec_slow += (log_spec - self.spec_slow) * (1.0 - math.exp(-dt / 4.0))
+        nov = float(np.mean(np.abs(self.spec_fast - self.spec_slow))) / max(0.05, float(np.mean(self.spec_slow)))
+        self.nov_base += (nov - self.nov_base) * (1.0 - math.exp(-dt / 8.0))
+        novelty = nov / max(0.02, self.nov_base) - 1.0
+        self.peak_hold = max(frame_loud, self.peak_hold * math.exp(-dt / 0.25))
+        if self.peak_ref <= 0.0:
+            self.peak_ref = self.peak_hold
+        jump = self.peak_hold / max(0.01, self.peak_ref) - 1.0      # > 0 only for a new 10 s maximum
+        self.peak_ref = max(self.peak_hold, self.peak_ref * math.exp(-dt / 10.0))
+        raw = max(0.0, max(0.0, rise) + 0.6 * max(0.0, bass_ret) + 0.5 * max(0.0, novelty)
+                  + max(0.0, jump - 0.5) - self.ACCENT_DEAD)
+        self.accent_parts = (rise, bass_ret, novelty, jump)
+        self.accent = max(min(3.0, raw), self.accent * math.exp(-dt / self.ACCENT_TAU))
 
     TEMPO_MIN, TEMPO_MAX = 0.30, 1.20   # beat period search, s (50-200 BPM)
     TEMPO_GRID = 0.01                   # onset curve is resampled to 10 ms before the comb
@@ -272,6 +335,7 @@ class Bands:
         # frames without fresh PCM still pass time: keep the clock and beat phase running
         self.clock += dt
         self.beat_phase = (self.beat_phase + 2 * math.pi * max(0., min(0.1, dt)) / max(0.28, self.beat_period)) % (2 * math.pi)
+        self.accent *= math.exp(-dt / self.ACCENT_TAU)
         self.envelope = [v * math.exp(-dt / .12) for v in self.envelope]
         return self.envelope[:]
 
@@ -287,6 +351,7 @@ FOLD_OCTAVES = 3
 IMPRINT_MODES = 4       # body outline modes carried out by a ring (higher ones would kink a 200-pt ring)
 IMPRINT_BUDGET = 0.6    # max sum(|a_m| m^2) of the carried outline: <= ~4 units of ring curvature at r 6600
 CURV_MAX = 14.6         # emitted body second-difference ceiling (heliosctl galvo bound 15)
+BEAT_PUNCH = 0.55       # body punch on a beat that earns no ring (a ring birth punches 1.0)
 GRAD_MAX = 0.20
 CURL_GAIN = 0.012       # shape contribution of the curl noise (psi itself still drives the 4D fold gradient)
 FOLD_GAIN = 1.0         # peak 4D fold angle = FOLD_GAIN*2 rad*grad (tuned against curvature bound)
@@ -326,7 +391,20 @@ class BeatRings:
     Silence (activity below SIG_ON/SIG_OFF, with hysteresis) births nothing on any path;
     a ring already in flight still finishes, and the first ring after silence comes
     with the music (the spawn timer is reset on the silence->signal edge).
+
+    Earned, not perpetual: when the caller supplies an `accent` (Bands.accent: how much
+    the last beat stands out from the last ~10 s), a beat wrap or onset only births a
+    ring once enough credit has been earned.  Credit accrues at 1/floor_gap(act) per
+    second (FLOOR_MAX s apart when quiet, FLOOR_MIN when loud: density follows energy)
+    plus accent/beat_period (an accent of 1 - the loudness doubled - earns a ring every
+    beat; a drop or a section change earns one on the very next wrap).  Spending resets
+    it, so a steady passage shows a ring every few beats and the body's beat punch
+    (`beat_hit`, every locked wrap) carries the beats in between.  With accent=None
+    (no analysis available) every wrap earns a ring, as before.
     """
+    FLOOR_MIN = 1.5         # floor ring spacing at full energy, s
+    FLOOR_MAX = 5.0         # ...and in the quietest passage that still counts as signal
+    IMPULSE = 1.0           # credit per unit of sudden accent rise beyond the ordinary (a jump of 1 earns a ring outright)
     LOCK_ON = 0.25
     LOCK_OFF = 0.12
     FREE_LIFE = 1.35
@@ -350,16 +428,35 @@ class BeatRings:
         self.signal = False
         self.beats = 1
         self.rate = 1.0 / self.FREE_LIFE
-        self.ring = None   # dict: frac, color, kind, life, beats, theta0
+        self.ring = None   # dict: frac, color, kind, life, beats, theta0, weight
         self.spawned = {'beat': 0, 'onset': 0, 'idle': 0}
+        self.credit = 1.0       # earned ring credit, 0..1; a ring is born when it reaches 1
+        self.prev_accent = 0.0
+        self.weight = 1.0       # weight of the next ring: 0.5 floor ring .. 1 full accent ring
+        self.beat_hit = False   # True on the frame of every locked beat wrap (the body punches on it)
 
     def _spawn(self, kind, now, color, life, theta0=None, frac0=0.0):
         self.ring = {'frac': frac0, 'color': color, 'kind': kind, 'life': life,
-                     'beats': self.beats, 'theta0': theta0}
+                     'beats': self.beats, 'theta0': theta0, 'weight': self.weight}
         self.last_spawn_time = now
         self.spawned[kind] += 1
+        self.credit = 0.0
 
-    def update(self, now, dt, beat_phase, beat_period, beat_lock, act, onset, color):
+    def _earn(self, dt, act, accent, beat_period):
+        if accent is None:
+            self.credit, self.weight = 1.0, 1.0
+            return
+        gap = self.FLOOR_MIN + (self.FLOOR_MAX - self.FLOOR_MIN) * (1.0 - min(1.0, act)) ** 1.5
+        # A sustained accent earns at accent/beat.  A sudden one (a drop, a section change)
+        # is credited at once: an increase too large to be the peak-hold re-triggering on
+        # an ordinary beat (that adds at most ~0.8 x the held value).
+        step = accent - self.prev_accent
+        sudden = max(0.0, step - 0.8 * self.prev_accent - 0.4)
+        self.credit = min(1.0, self.credit + dt * (1.0 / gap + accent / beat_period) + self.IMPULSE * sudden)
+        self.prev_accent = accent
+        self.weight = min(1.0, 0.5 + 0.5 * accent)
+
+    def update(self, now, dt, beat_phase, beat_period, beat_lock, act, onset, color, accent=None):
         dt = max(0.0, min(dt, 0.1))
         beat_period = max(0.28, beat_period)
         # --- unwrap the PLL phase into continuous beat cycles ---
@@ -394,23 +491,29 @@ class BeatRings:
             # fallback waits only 0.25 s (activity crosses SIG_ON a frame or two before
             # the kick itself clears the onset threshold, so idle must not pre-empt it)
             self.last_spawn_time = now - (self.IDLE_GAP - 0.25)
+            self.credit = 1.0           # music (re)starting is an event in itself
+        if self.signal:
+            self._earn(dt, act, accent, beat_period)
+        earned = self.credit >= 1.0
+        self.beat_hit = self.signal and self.locked and wrapped
         # --- spawn ---
         spawned_on_beat = False
         if not self.signal:
             pass
-        elif self.locked and wrapped and cycle - self.last_spawn_cycle >= self.beats:
+        elif self.locked and wrapped and cycle - self.last_spawn_cycle >= self.beats and earned:
             ideal0 = (self.theta - TWO_PI * cycle) / (TWO_PI * self.beats)
             self._spawn('beat', now, color, None, theta0=TWO_PI * cycle,
                         frac0=min(0.25, max(0.0, ideal0)))
             self.last_spawn_cycle = cycle
             spawned_on_beat = True
-        elif (not self.locked and onset and now - self.last_spawn_time > 0.28
+        elif (not self.locked and onset and earned and now - self.last_spawn_time > 0.28
                 and (self.ring is None or self.ring['frac'] > 0.5)):
             self._spawn('onset', now, color, self.FREE_LIFE)
             self.last_spawn_cycle = cycle
-        elif self.ring is None:
-            gap = self.IDLE_GAP if not self.locked else max(self.IDLE_GAP, 1.5 * self.beats * beat_period)
-            if now - self.last_spawn_time > gap:
+        elif self.ring is None and not self.locked and earned:
+            # unlocked and nothing to answer: a slow idle ring once the floor is earned
+            # (locked, the floor ring waits for the next wrap so it still lands on the beat)
+            if now - self.last_spawn_time > self.IDLE_GAP:
                 self._spawn('idle', now, (110, 220, 255), self.IDLE_LIFE)
                 self.last_spawn_cycle = cycle
         # --- advance ---
@@ -481,7 +584,7 @@ class LiquidContour:
 
     def sample(self, level, bands, now, dt, depth=.07, frequency=8, flux=0., centroid=.25, pitch_angle=None,
                sub_flux=None, beat_phase=0., hat_phase=0., beat_lock=0., hat_lock=0., activity=None,
-               emitters=None, beat_period=0.5):
+               emitters=None, beat_period=0.5, accent=None):
         bass, mid, high = bands
         kick_f, snare_f, hat_f = sub_flux if sub_flux is not None else (flux * bass, flux * mid, flux * high)
         energy = max(bass, .85 * mid, .7 * high, .9 * flux)
@@ -522,13 +625,19 @@ class LiquidContour:
         # --- BPM-locked ring (spawn / expansion) ---
         ring_onset = act > 0.18 and (kick_f > 0.24 or bass > 0.20 or snare_f > 0.28)
         ring_color = (110, 220, 255) if kick_f >= snare_f else (255, 185, 80)
-        on_beat = self.rings.update(now, dt, beat_phase, beat_period, beat_lock, act, ring_onset, ring_color)
-        # Torsion spring: audio torque and each beat-ring birth wind the twist up;
-        # spring + damping release it, so the fold breathes in time with the BPM.
+        on_beat = self.rings.update(now, dt, beat_phase, beat_period, beat_lock, act, ring_onset, ring_color,
+                                    accent=accent)
+        # Torsion spring: audio torque and each beat wind the twist up; spring + damping
+        # release it, so the fold breathes in time with the BPM.  The body punches on
+        # every locked beat, harder when it also sheds a ring: the beat stays visible on
+        # the beats that earn no ring.
         drive = 0.55 * (beat_pulse + 0.45 * kick_f + 0.25 * snare_f) * act
         if on_beat:
             self.twist_vel += 1.2 * act
             self.punch = 1.0
+        elif self.rings.beat_hit:
+            self.twist_vel += 0.6 * act
+            self.punch = max(self.punch, BEAT_PUNCH)
         self.punch *= math.exp(-step_dt / 0.09)
         self.twist_vel += (2.2 * drive - 6.0 * self.twist - 2.2 * self.twist_vel) * step_dt
         self.twist = max(-0.85, min(0.85, self.twist + self.twist_vel * step_dt))
@@ -637,6 +746,7 @@ class LiquidContour:
         if ring is not None:
             frac = ring['frac']
             fade = max(0.0, 1.0 - frac ** 1.8) * (0.35 + 0.65 * act)   # holds its light, dies at the edge
+            fade *= 0.6 + 0.4 * ring.get('weight', 1.0)                 # floor rings are softer than accents
         if ring is not None and fade >= 0.03:
             r0 = 1.18 * r_core
             rw = r0 + (RING_R_MAX - r0) * frac
