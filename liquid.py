@@ -284,6 +284,7 @@ DWELL_OFF = 2           # extra blank repeats of the last curve point before a j
 DWELL_ON = 3            # blank repeats at a landing point before relighting (galvo settle)
 BLANK_STEP = 760.0      # max ILDA step of an eased blank move (smoothstep peak ~1.5x mean)
 FOLD_OCTAVES = 3
+CURV_MAX = 14.6         # emitted body second-difference ceiling (heliosctl galvo bound 15)
 GRAD_MAX = 0.20
 CURL_GAIN = 0.012       # shape contribution of the curl noise (psi itself still drives the 4D fold gradient)
 FOLD_GAIN = 1.0         # peak 4D fold angle = FOLD_GAIN*2 rad*grad (tuned against curvature bound)
@@ -589,8 +590,17 @@ class LiquidContour:
             blend = min(1.0, min(560.0, 22400.0 * max(dt, 0.01)) / max(1e-9, movement))
             pts = self.previous + blend * (pts - self.previous)
         pts[-1] = pts[0]                        # exact seam closure
-        self.previous = pts
+        # Galvo guard on what is actually emitted (integer rounding alone adds up to ~2): the
+        # second difference is linear in scale, so shrink the body about its centre the few
+        # percent needed whenever beat kicks stack past CURV_MAX.
         core = np.rint(pts).astype(np.int64)
+        for _ in range(4):
+            curv = float(np.max(np.hypot(*(core[2:] - 2 * core[1:-1] + core[:-2]).T)))
+            if curv <= CURV_MAX:
+                break
+            pts = pts * ((CURV_MAX - 1.0) / curv)
+            core = np.rint(pts).astype(np.int64)
+        self.previous = pts
 
         crest = np.minimum(1.0, np.maximum(0.0, splash) * act + 0.65 * hat_sync * np.maximum(0.0, w_hat)
                            + 0.85 * act * np.abs(w0) * grad)
