@@ -30,6 +30,13 @@ class Bands:
         self.noise_floor = .008
         self.loud_hist = []
         self.beat_hist = []
+        self.beat_t = []         # timestamp of each beat_hist entry (s): frames are ~22.5 ms, not 25
+        self.clock = 0.          # Bands-local time, advanced by every update/decay dt
+        self.last_kick = -1.
+        self.kick_misses = 0
+        self.bass_log = math.log(1e-4)
+        self.kick_peak = 0.3     # decaying peak of the bass log-energy jump (kick vs snare discriminator)
+        self.tempo_votes = 0     # consecutive comb estimates asking for a different tempo octave
         self.hat_hist = []
         self.beat_period = 0.50
         self.hat_period = 0.125
@@ -63,6 +70,7 @@ class Bands:
             self.flux = 0.
             self.sub_flux = [0., 0., 0.]
             self.activity *= math.exp(-dt / 0.25)
+            self.beat_lock *= math.exp(-dt / 0.6)    # no music: confidence fades, never sticks
             return self.decay(dt)
 
         self.pcm_ring = np.roll(self.pcm_ring, -320)
@@ -115,26 +123,12 @@ class Bands:
         step_dt = max(0.005, min(0.05, dt))
         beat_drive = max(self.sub_flux[0], 0.85 * self.sub_flux[1])
         hat_drive = self.sub_flux[2]
-        self.beat_hist = (self.beat_hist + [beat_drive])[-240:]
+        self.clock += dt
+        self.beat_hist = (self.beat_hist + [beat_drive])[-300:]
+        self.beat_t = (self.beat_t + [self.clock])[-300:]
         self.hat_hist = (self.hat_hist + [hat_drive])[-160:]
         if len(self.beat_hist) >= 64 and len(self.beat_hist) % 4 == 0:
-            bh = np.asarray(self.beat_hist, dtype=np.float64)
-            n_bh = len(bh)
-            weights = 0.992 ** np.arange(n_bh - 1, -1, -1)
-            wbh = bh * weights
-            energy_norm = float(np.dot(wbh, wbh)) + 1e-6
-            best_lag, best_score = 20, 0.0
-            for lag in range(13, min(33, n_bh // 2)):
-                score = float(np.dot(wbh[lag:], wbh[:-lag]))
-                if 2 * lag < n_bh:
-                    score += 0.55 * float(np.dot(wbh[2 * lag:], wbh[:-2 * lag]))
-                if 3 * lag < n_bh:
-                    score += 0.30 * float(np.dot(wbh[3 * lag:], wbh[:-3 * lag]))
-                if score > best_score:
-                    best_score, best_lag = score, lag
-            self.beat_lock = min(1.0, best_score / energy_norm) * self.activity
-            if self.beat_lock > 0.16:
-                self.beat_period += (best_lag * 0.025 - self.beat_period) * 0.22
+            self._estimate_tempo()
         if len(self.hat_hist) >= 32 and len(self.hat_hist) % 3 == 0:
             hh = np.asarray(self.hat_hist, dtype=np.float64)
             n_hh = len(hh)
@@ -152,12 +146,37 @@ class Bands:
                     best_hscore, best_hlag = score, lag
             self.hat_lock = min(1.0, best_hscore / henergy) * self.activity
             if self.hat_lock > 0.14:
-                self.hat_period += (best_hlag * 0.025 - self.hat_period) * 0.25
+                frame_s = (self.beat_t[-1] - self.beat_t[0]) / max(1, len(self.beat_t) - 1)
+                self.hat_period += (best_hlag * frame_s - self.hat_period) * 0.25
 
-        self.beat_phase = (self.beat_phase + 2 * math.pi * step_dt / max(0.28, self.beat_period)) % (2 * math.pi)
-        if beat_drive > 0.45 and self.activity > 0.25:
-            err = math.atan2(math.sin(-self.beat_phase), math.cos(-self.beat_phase))
-            self.beat_phase = (self.beat_phase + 0.35 * beat_drive * err) % (2 * math.pi)
+        # Beat PLL (2nd order).  Phase 0 is the kick itself: detection lands BEAT_LATENCY after
+        # the audio, so a detected onset should find the phase already that far past 0.
+        period = max(0.28, self.beat_period)
+        self.beat_phase = (self.beat_phase + 2 * math.pi * step_dt / period) % (2 * math.pi)
+        # Only kick-like onsets steer the phase: a bass log-energy jump near its recent peak.
+        # Snares and fills feed the tempo comb but would otherwise pull phase 0 onto the backbeat.
+        bass_log = math.log(self.energy[0] + 1e-4)
+        kick = max(0.0, bass_log - self.bass_log)
+        self.bass_log = bass_log
+        self.kick_peak = max(kick, 0.3, self.kick_peak * math.exp(-step_dt / 2.5))
+        # The bass jump, not the first flux frame, times the kick: a kick starting late in a
+        # 20 ms block shows flux there but lands its energy in the next block.
+        is_kick = (beat_drive > 0.16 and kick > 0.6 * self.kick_peak
+                   and self.clock - self.last_kick > 0.12 and self.activity > 0.05)
+        if is_kick:
+            self.last_kick = self.clock
+            err = _wrap_pi(2 * math.pi * self.BEAT_LATENCY / period - self.beat_phase)
+            # off-beat kicks (syncopation) are ignored, but 3 in a row means we locked onto the
+            # wrong phase: accept the next one whatever its error (re-acquire)
+            in_window = abs(err) < 0.30 * 2 * math.pi
+            self.kick_misses = 0 if in_window else self.kick_misses + 1
+            if in_window or self.kick_misses > 3:
+                self.kick_misses = 0
+                w = min(1.0, beat_drive)
+                kp = 0.55 - 0.25 * self.beat_lock        # pull hard to acquire, gently once locked
+                self.beat_phase = (self.beat_phase + kp * w * err) % (2 * math.pi)
+                # integral path: an early onset (err > 0) means our period is too long
+                self.beat_period = min(1.25, max(0.28, period * (1.0 - 0.10 * w * err / (2 * math.pi))))
         self.hat_phase = (self.hat_phase + 2 * math.pi * step_dt / max(0.06, self.hat_period)) % (2 * math.pi)
         if hat_drive > 0.35 and self.activity > 0.25:
             herr = math.atan2(math.sin(-self.hat_phase), math.cos(-self.hat_phase))
@@ -188,7 +207,71 @@ class Bands:
             self.envelope[i] += (target - self.envelope[i]) * (1.0 - math.exp(-dt / tau))
         return self.envelope[:]
 
+    TEMPO_MIN, TEMPO_MAX = 0.30, 1.20   # beat period search, s (50-200 BPM)
+    TEMPO_GRID = 0.01                   # onset curve is resampled to 10 ms before the comb
+    BEAT_LATENCY = 0.035                # kick audio -> detected onset frame, s (block fill + newest-block wait + frame)
+
+    def _estimate_tempo(self):
+        """Comb tempo estimate on a uniform time grid (entries are timestamped, so the frame rate
+        does not bias the period), sub-grid peak interpolation, and a lock confidence that is
+        a normalised autocorrelation: loudness-independent, ~0 for noise or silence."""
+        t = np.asarray(self.beat_t, dtype=np.float64)
+        grid = np.arange(t[0], t[-1], self.TEMPO_GRID)
+        if len(grid) < 2 * int(self.TEMPO_MAX / self.TEMPO_GRID) + 4:
+            return
+        x = np.interp(grid, t, np.asarray(self.beat_hist, dtype=np.float64))
+        x = (x - float(np.mean(x))) * np.exp(-(grid[-1] - grid) / 3.2)
+        n = len(x)
+        spec = np.fft.rfft(x, 2 * n)
+        ac = np.fft.irfft(spec * np.conj(spec))[:n]
+        if ac[0] < 1e-7:
+            self.beat_lock *= 0.7
+            return
+        ac /= ac[0]
+        lo, hi = int(self.TEMPO_MIN / self.TEMPO_GRID), int(self.TEMPO_MAX / self.TEMPO_GRID)
+        lags = np.arange(lo, hi + 1)
+        comb = ac[lags] + 0.5 * ac[np.minimum(2 * lags, n - 1)] + 0.25 * ac[np.minimum(3 * lags, n - 1)]
+        prior = np.exp(-0.5 * (np.log2(lags * self.TEMPO_GRID / 0.5) / 1.1) ** 2)   # mild 120 BPM prior
+        score = comb * (0.7 + 0.3 * prior)
+        k = int(np.argmax(score))
+        lag = float(lags[k])
+        if 0 < k < len(score) - 1:
+            a, b, c = score[k - 1], score[k], score[k + 1]
+            den = a - 2 * b + c
+            if den < 0:
+                lag += 0.5 * (a - c) / den
+        est = lag * self.TEMPO_GRID
+        raw_lock = min(1.0, max(0.0, (float(ac[lags[k]]) - 0.08) / 0.45))
+        self.beat_lock += (raw_lock - self.beat_lock) * 0.35
+        if raw_lock < 0.2:
+            return
+        cur = self.beat_period / self.TEMPO_GRID
+        if abs(math.log2(est / self.beat_period)) > 0.12 and lo <= cur <= hi:
+            # Another tempo (or octave) peak.  Kick+snare music has near-equal comb peaks at
+            # P and 1.5P/2P, so jump only when the new peak clearly wins for ~0.5 s, and never
+            # slew through the tempos in between; meanwhile keep tracking the local peak.
+            sc_cur = float(np.interp(cur, lags, score))
+            self.tempo_votes = self.tempo_votes + 1 if score[k] > 1.15 * sc_cur else 0
+            if self.tempo_votes >= 6:
+                self.beat_period, self.tempo_votes = est, 0
+                return
+            near = np.abs(np.log2(lags / cur)) < 0.08
+            k = int(np.argmax(np.where(near, score, -np.inf)))
+            lag = float(lags[k])
+            if 0 < k < len(score) - 1 and near[k - 1] and near[k + 1]:
+                a, b, c = score[k - 1], score[k], score[k + 1]
+                den = a - 2 * b + c
+                if den < 0:
+                    lag += 0.5 * (a - c) / den
+            est = lag * self.TEMPO_GRID
+        else:
+            self.tempo_votes = 0
+        self.beat_period += (est - self.beat_period) * 0.25
+
     def decay(self, dt):
+        # frames without fresh PCM still pass time: keep the clock and beat phase running
+        self.clock += dt
+        self.beat_phase = (self.beat_phase + 2 * math.pi * max(0., min(0.1, dt)) / max(0.28, self.beat_period)) % (2 * math.pi)
         self.envelope = [v * math.exp(-dt / .12) for v in self.envelope]
         return self.envelope[:]
 
@@ -228,8 +311,9 @@ class BeatRings:
 
     Locked (beat_lock high, hysteresis LOCK_ON/LOCK_OFF):
       * the PLL beat_phase is unwrapped into a continuous cycle count; a ring spawns on
-        a phase wrap (phase 0 is where the PLL pulls detected kicks), every `beats`
-        wraps, with beats in {1,2,4} chosen so a ring lives 0.75-1.5 s at any tempo;
+        the predicted phase wrap (phase 0 is where the PLL puts the kick), every `beats`
+        wraps: one ring per beat up to ~130 BPM, one per two beats above (a ring that
+        spans 2-4 beats at mid tempos read as 'beat adjacent' on the wall);
       * a ring's expansion fraction advances at a rate that is slewed (tau RATE_TAU)
         toward 1/(beats*beat_period) so it reaches the edge exactly when the next ring
         is born, and a small proportional pull toward the PLL-derived ideal fraction
@@ -248,9 +332,10 @@ class BeatRings:
     SIG_ON = 0.06           # activity above which there is music to answer
     SIG_OFF = 0.03          # ...and below which it is silence again (room floor sits at ~0)
     RATE_TAU = 0.45
+    RATE_SLEW = 0.7         # max change of the expansion rate, 1/s per s (no visible speed jump on a tempo change)
     PHASE_GAIN = 1.2
-    MIN_LIFE = 0.75         # a ring spans 1/2/4 beats; double up while a ring would live < MIN_LIFE s
-    MAX_LIFE = 0.80         # ...and halve again only if the shorter ring would still live >= MAX_LIFE s (> MIN_LIFE: no flapping)
+    MIN_LIFE = 0.46         # one ring per beat down to 0.46 s (~130 BPM); faster tempos double up
+    MAX_LIFE = 0.50         # ...and halve again only if the shorter ring would still live >= MAX_LIFE s (> MIN_LIFE: no flapping)
 
     def __init__(self):
         self.prev_phase = None
@@ -282,7 +367,10 @@ class BeatRings:
         else:
             self.theta += _wrap_pi(beat_phase - self.prev_phase)
         self.prev_phase = beat_phase
-        cycle = int(math.floor(self.theta / TWO_PI))
+        # Spawn on the *predicted* beat: the frame nearest phase 0 (half a frame of lead), not
+        # the first frame after it, so the ring is born on the beat rather than up to a frame late.
+        lead = math.pi * dt / beat_period
+        cycle = int(math.floor((self.theta + lead) / TWO_PI))
         wrapped = cycle > self.max_cycle     # a backward PLL nudge can never re-fire a beat
         if wrapped:
             self.max_cycle = cycle
@@ -329,7 +417,8 @@ class BeatRings:
                 target = 1.0 / (self.beats * beat_period)
             else:
                 target = 1.0 / (ring['life'] or self.FREE_LIFE)
-            self.rate += (target - self.rate) * (1.0 - math.exp(-dt / self.RATE_TAU))
+            step = (target - self.rate) * (1.0 - math.exp(-dt / self.RATE_TAU))
+            self.rate += max(-self.RATE_SLEW * dt, min(self.RATE_SLEW * dt, step))
             speed = self.rate
             if self.locked and ring['kind'] == 'beat':
                 ideal = (self.theta - ring['theta0']) / (TWO_PI * ring['beats'])

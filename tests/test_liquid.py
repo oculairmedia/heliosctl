@@ -216,6 +216,73 @@ class BeatRingTests(unittest.TestCase):
         self.assertLess(c.morph_clock, 8 * math.pi + 1e-9)
 
 
+def drum_track(bpm, amp, seconds, style='four', offset=.137, sr=16000):
+    """Synthetic PCM. 'four': kick every beat, clap on 2/4, offbeat hats; 'kick': kick only."""
+    import numpy as np
+    period = 60. / bpm
+    t = np.arange(int(seconds * sr)) / sr
+    y = np.zeros_like(t)
+    beats = np.arange(offset, seconds, period)
+    def hit(at, kind):
+        m = (t >= at) & (t < at + .4)
+        tt = t[m] - at
+        if kind == 'kick':
+            y[m] += amp * np.exp(-tt / .09) * np.sin(2 * np.pi * (48 * tt + 2.4 * (1 - np.exp(-tt / .04))))
+        elif kind == 'snare':
+            y[m] += .45 * amp * np.exp(-tt / .05) * np.sin(2 * np.pi * 330 * tt) * (1 + .3 * np.sin(2 * np.pi * 1700 * tt))
+        else:
+            y[m] += .15 * amp * np.exp(-tt / .01) * np.sin(2 * np.pi * 5200 * tt)
+    for n, at in enumerate(beats):
+        hit(at, 'kick')
+        if style == 'four':
+            if n % 2:
+                hit(at, 'snare')
+            hit(at + period / 2, 'hat')
+    y += .03 * amp * np.sin(2 * np.pi * 220 * t) * (1 + .5 * np.sin(2 * np.pi * .3 * t))
+    return np.clip(np.rint(y * 32767), -32768, 32767).astype(int), beats, period
+
+
+class TempoLockTests(unittest.TestCase):
+    """Beat rings land on the beat: Bands' tempo PLL, driven exactly as heliosctl drives it
+    (DAC-paced 22.5 ms frames, newest complete 20 ms mic block per frame)."""
+    FRAME = .0225
+
+    def follow(self, bpm, amp, style, seconds=14., settle=8.):
+        pcm, beats, period = drum_track(bpm, amp, seconds, style)
+        b, c, seq_prev = Bands(), LiquidContour(), -1
+        births, locks = [], []
+        for i in range(int(seconds / self.FRAME)):
+            now = (i + 1) * self.FRAME
+            seq = int(now / .02) - 1
+            if seq != seq_prev:
+                levels, seq_prev = b.update(pcm[seq * 320:(seq + 1) * 320].tolist(), self.FRAME), seq
+            else:
+                levels = b.decay(self.FRAME)
+            before = c.rings.spawned['beat']
+            c.sample(.3, [math.sqrt(min(1., max(0., v))) for v in levels], now, self.FRAME, .07, 5,
+                     flux=b.flux, sub_flux=b.sub_flux, beat_phase=b.beat_phase, beat_lock=b.beat_lock,
+                     activity=b.activity, beat_period=b.beat_period)
+            if now > settle:
+                locks.append(b.beat_lock)
+                if c.rings.spawned['beat'] > before:
+                    births.append(now)
+        offsets = [min(abs(x - beats)) for x in births]
+        return b, c, period, births, offsets, sum(locks) / len(locks)
+
+    def test_rings_land_on_the_beat_quiet_slow_and_fast(self):
+        for bpm, amp, style in ((128, .06, 'four'),    # quiet but steady
+                                (66, .3, 'kick'),      # below the old 75 BPM search floor
+                                (190, .4, 'kick')):    # above the old 185 BPM ceiling
+            b, c, period, births, offsets, lock = self.follow(bpm, amp, style)
+            with self.subTest(bpm=bpm, amp=amp):
+                self.assertAlmostEqual(b.beat_period, period, delta=.02 * period)
+                self.assertGreater(lock, BeatRings.LOCK_ON)
+                expected = 6. / (c.rings.beats * period)
+                self.assertGreaterEqual(len(births), int(.8 * expected))
+                on_beat = sum(1 for o in offsets if o < .035) / max(1, len(offsets))
+                self.assertGreaterEqual(on_beat, .8, f'births off the beat: {[round(o, 3) for o in offsets]}')
+
+
 class SilenceTests(unittest.TestCase):
     """No audio -> no rings.  A ring is a response to music, never to elapsed time."""
     def test_pure_silence_spawns_no_rings(self):
