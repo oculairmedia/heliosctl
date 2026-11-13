@@ -85,7 +85,7 @@ class Control:
         elif cmd != 'status' or set(msg) != {'command'}:
             raise ValueError('invalid command')
         return {'state': 'stopping' if self.stopping else 'running', 'pid': os.getpid(),
-                'params': self.params, 'remaining': max(0, (self.deadline or now) - now)}
+                'params': self.params, 'remaining': None if self.deadline == math.inf else max(0, (self.deadline or now) - now)}
 
     def poll(self, now):
         # Fixed work budget; slow/EOF/flood clients cannot block the frame path.

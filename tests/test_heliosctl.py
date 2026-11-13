@@ -204,6 +204,22 @@ class TestHeliosCli(unittest.TestCase):
             h.run_play(args, sdk_factory=FakeSDK)
         self.assertFalse(FakeSDK.instances)
 
+    def test_duration_cap_removed_and_none_is_unbounded(self):
+        # The old <=300 s cap was removed on request; None runs until stopped.
+        import signal as sig
+        class Stopper(FakeSDK):
+            def status(self, dev):
+                sig.raise_signal(sig.SIGTERM)
+                return 1
+        for duration in (301, 3600.0, None):
+            args = SimpleNamespace(file=str(self.path), duration=duration, pps=20000, ready_timeout=1, library="fake")
+            h.run_play(args, sdk_factory=Stopper)
+            self.assertEqual(FakeSDK.instances[-1].stops, [0])
+        for duration in (0, -5, math.nan):
+            args = SimpleNamespace(file=str(self.path), duration=duration, pps=20000, ready_timeout=1, library="fake")
+            with self.assertRaisesRegex(h.CliError, "duration"):
+                h.run_play(args, sdk_factory=FakeSDK)
+
     def test_cli_devices_checks_open_and_cleanup_results(self):
         class CliSDK(FakeSDK):
             def __init__(self, lib):

@@ -193,100 +193,347 @@ class Bands:
         return self.envelope[:]
 
 
-class LiquidContour:
-    """Centered liquid sphere with outward expanding concentric radio rings.
+TWO_PI = 2.0 * math.pi
+N_CORE = 220            # twist body points (indices 0..219, seam closes 0 == 219)
+N_RING = 220            # one expanding ring (indices 222..441 when drawn)
+N_FRAME = 450           # constant frame size: 22.5 ms @ 20 kpps = 44.4 Hz refresh
+FOLD_OCTAVES = 3
+GRAD_MAX = 0.20
+CURL_GAIN = 0.012       # shape contribution of the curl noise (psi itself still drives the 4D fold gradient)
+FOLD_GAIN = 1.0         # peak 4D fold angle = FOLD_GAIN*2 rad*grad (tuned against curvature bound)
+RING_R_MAX = 7200.0     # keeps ring chord spacing (2*pi*r/219) under the 225-unit segment bound
+_A = np.linspace(0.0, TWO_PI, N_CORE)
+_COS_A = np.cos(_A)
+_SIN_A = np.sin(_A)
+_RING_A = np.linspace(0.0, TWO_PI, N_RING)
+_RING_COS = np.cos(_RING_A)
+_RING_SIN = np.sin(_RING_A)
 
-    Total points across core sphere + active concentric rings is ~400 points,
-    yielding 50 Hz refresh rate at 20 kpps (completely flicker-free).
+
+def _wrap_pi(x):
+    return math.atan2(math.sin(x), math.cos(x))
+
+
+class BeatRings:
+    """One expanding ring at a time, locked to the Bands beat PLL.
+
+    Locked (beat_lock high, hysteresis LOCK_ON/LOCK_OFF):
+      * the PLL beat_phase is unwrapped into a continuous cycle count; a ring spawns on
+        a phase wrap (phase 0 is where the PLL pulls detected kicks), every `beats`
+        wraps, with beats in {1,2,4} chosen so a ring lives 0.75-1.5 s at any tempo;
+      * a ring's expansion fraction advances at a rate that is slewed (tau RATE_TAU)
+        toward 1/(beats*beat_period) so it reaches the edge exactly when the next ring
+        is born, and a small proportional pull toward the PLL-derived ideal fraction
+        keeps it phase-locked without visible speed jumps when the tempo estimate moves;
+    Unlocked: rings follow flux/bass onsets with a fixed lifetime, and a slow idle ring
+    is born whenever none has been seen for IDLE_GAP seconds, so rings never stop.
     """
+    LOCK_ON = 0.25
+    LOCK_OFF = 0.12
+    FREE_LIFE = 1.35
+    IDLE_LIFE = 2.4
+    IDLE_GAP = 1.0
+    RATE_TAU = 0.45
+    PHASE_GAIN = 1.2
+    MIN_LIFE = 0.75         # a ring spans 1/2/4 beats; double up while a ring would live < MIN_LIFE s
+    MAX_LIFE = 0.80         # ...and halve again only if the shorter ring would still live >= MAX_LIFE s (> MIN_LIFE: no flapping)
+
+    def __init__(self):
+        self.prev_phase = None
+        self.theta = 0.0
+        self.max_cycle = 0
+        self.last_spawn_cycle = 0
+        self.last_spawn_time = -1e9
+        self.locked = False
+        self.beats = 1
+        self.rate = 1.0 / self.FREE_LIFE
+        self.ring = None   # dict: frac, color, kind, life, beats, theta0
+        self.spawned = {'beat': 0, 'onset': 0, 'idle': 0}
+
+    def _spawn(self, kind, now, color, life, theta0=None, frac0=0.0):
+        self.ring = {'frac': frac0, 'color': color, 'kind': kind, 'life': life,
+                     'beats': self.beats, 'theta0': theta0}
+        self.last_spawn_time = now
+        self.spawned[kind] += 1
+
+    def update(self, now, dt, beat_phase, beat_period, beat_lock, act, onset, color):
+        dt = max(0.0, min(dt, 0.1))
+        beat_period = max(0.28, beat_period)
+        # --- unwrap the PLL phase into continuous beat cycles ---
+        if self.prev_phase is None:
+            self.theta = beat_phase
+            self.max_cycle = int(math.floor(self.theta / TWO_PI))
+            self.last_spawn_cycle = self.max_cycle
+        else:
+            self.theta += _wrap_pi(beat_phase - self.prev_phase)
+        self.prev_phase = beat_phase
+        cycle = int(math.floor(self.theta / TWO_PI))
+        wrapped = cycle > self.max_cycle     # a backward PLL nudge can never re-fire a beat
+        if wrapped:
+            self.max_cycle = cycle
+        # --- lock state and beats-per-ring, both with hysteresis ---
+        if self.locked:
+            self.locked = beat_lock > self.LOCK_OFF
+        else:
+            self.locked = beat_lock > self.LOCK_ON
+        while self.beats < 4 and self.beats * beat_period < self.MIN_LIFE:
+            self.beats *= 2
+        while self.beats > 1 and (self.beats // 2) * beat_period >= self.MAX_LIFE:
+            self.beats //= 2
+        # --- spawn ---
+        spawned_on_beat = False
+        if self.locked and wrapped and cycle - self.last_spawn_cycle >= self.beats:
+            ideal0 = (self.theta - TWO_PI * cycle) / (TWO_PI * self.beats)
+            self._spawn('beat', now, color, None, theta0=TWO_PI * cycle,
+                        frac0=min(0.25, max(0.0, ideal0)))
+            self.last_spawn_cycle = cycle
+            spawned_on_beat = True
+        elif (not self.locked and onset and now - self.last_spawn_time > 0.28
+                and (self.ring is None or self.ring['frac'] > 0.5)):
+            self._spawn('onset', now, color, self.FREE_LIFE)
+            self.last_spawn_cycle = cycle
+        elif self.ring is None:
+            gap = self.IDLE_GAP if not self.locked else max(self.IDLE_GAP, 1.5 * self.beats * beat_period)
+            if now - self.last_spawn_time > gap:
+                self._spawn('idle', now, (110, 220, 255), self.IDLE_LIFE)
+                self.last_spawn_cycle = cycle
+        # --- advance ---
+        ring = self.ring
+        if ring is not None:
+            if self.locked:
+                target = 1.0 / (self.beats * beat_period)
+            else:
+                target = 1.0 / (ring['life'] or self.FREE_LIFE)
+            self.rate += (target - self.rate) * (1.0 - math.exp(-dt / self.RATE_TAU))
+            speed = self.rate
+            if self.locked and ring['kind'] == 'beat':
+                ideal = (self.theta - ring['theta0']) / (TWO_PI * ring['beats'])
+                speed += self.PHASE_GAIN * (min(1.2, max(0.0, ideal)) - ring['frac'])
+                speed = min(1.6 * self.rate, max(0.6 * self.rate, speed))
+            if not spawned_on_beat:
+                ring['frac'] += speed * dt
+            if ring['frac'] >= 1.0:
+                self.ring = None
+        return spawned_on_beat
+
+
+class LiquidContour:
+    """Twist-sphere body (torsion-spring twist, curl-noise octaves, 4D fold) with one
+    BPM-locked expanding ring (see BeatRings).  Every frame is exactly N_FRAME points
+    (core 220 + transit 2 + ring 220 + blank walk-back, or core twice when no ring is
+    visible) so the DAC refresh stays ~44 Hz at 20 kpps and brightness stays even.
+    """
+    MODES = ((2, 3), (3, 4), (2, 4), (1, 3))
+
     def __init__(self, seed=42):
-        self.random = random.Random(seed)
-        self.rings = []  # (birth_time, color)
-        self.last_onset = -10.0
-        self.phase = 0.0
-        self.color_phase = 0.0
-        self.tilt_phase = 0.0
+        self.previous = None
+        self.phase = 0.
+        self.knot_phase = 0.
+        self.morph_clock = 0.4
+        self.rot4d = 0.0
+        self.color_phase = 0.
+        self.tilt_phase = 0.
+        self.velocity = 0.35
+        self.direction = 1
+        self.last_onset = -math.inf
+        self.previous_bass = 0.
+        self.previous_energy = 0.
         self.onsets = 0
+        self.impulses = []
+        self.random = random.Random(seed)
+        self.mode_cur = 0
+        self.mode_nxt = 1
+        self.mode_blend = 1.0
+        self.twist = 0.0
+        self.twist_vel = 0.0
+        self.noise_clock = 0.0
+        # (k, omega, phase, amplitude). Curl term amplitude is A*k and its second
+        # difference scales A*k^3, so A ~ 1/k^2 keeps high octaves from kinking the line.
+        octs = [(3, 0.55, 0.00, 1.00), (5, 0.83, 2.10, 0.40), (7, 1.19, 4.40, 0.20),
+                (11, 1.61, 1.30, 0.08), (13, 2.13, 5.20, 0.06)]
+        self._oct_k = np.array([o[0] for o in octs], dtype=np.float64)
+        self._oct_w = np.array([o[1] for o in octs], dtype=np.float64)
+        self._oct_p = np.array([o[2] for o in octs], dtype=np.float64)
+        self._oct_a = np.array([o[3] for o in octs], dtype=np.float64)
+        self.rings = BeatRings()
+        self.colors = None
 
     def sample(self, level, bands, now, dt, depth=.07, frequency=8, flux=0., centroid=.25, pitch_angle=None,
                sub_flux=None, beat_phase=0., hat_phase=0., beat_lock=0., hat_lock=0., activity=None,
-               emitters=None):
+               emitters=None, beat_period=0.5):
         bass, mid, high = bands
         kick_f, snare_f, hat_f = sub_flux if sub_flux is not None else (flux * bass, flux * mid, flux * high)
-        act = min(1.0, max(0.0, activity if activity is not None else max(level, max(bands))))
-        step_dt = min(dt, 0.05)
-        self.phase += (1.4 + 2.4 * bass + 1.2 * act) * step_dt
-        self.color_phase += (1.8 + 4.5 * max(bands) + 2.0 * centroid) * step_dt
-        self.tilt_phase += (0.85 + 1.6 * bass) * step_dt
-
-        # Spawn new expanding concentric radio ring on beat kicks / snare hits
-        if act > 0.18 and (kick_f > 0.24 or bass > 0.20 or snare_f > 0.28) and (now - self.last_onset) > 0.28:
+        energy = max(bass, .85 * mid, .7 * high, .9 * flux)
+        act = min(1.0, max(0.0, activity if activity is not None else max(level, energy)))
+        # --- body onsets: splash impulses and mode morphs (not the rings) ---
+        if act > 0.22 and ((kick_f > .32) or (snare_f > .36) or (flux > .34)
+                or (bass > .24 and bass - self.previous_bass > .09)
+                or (energy > .28 and energy - self.previous_energy > .11)) and now - self.last_onset > .18:
+            if snare_f > kick_f * 1.1:
+                self.direction *= -1
             self.last_onset = now
             self.onsets += 1
-            col = (110, 220, 255) if kick_f >= snare_f else (255, 185, 80)
-            self.rings.append((now, col))
+            angle0 = ((pitch_angle + self.random.uniform(-.20, .20)) % TWO_PI if pitch_angle is not None
+                      else self.random.uniform(0, TWO_PI))
+            self.impulses = (self.impulses + [(now, angle0, self.random.choice((-1, 1)))])[-4:]
+            if self.mode_blend >= 0.85:
+                self.mode_cur = self.mode_nxt
+                self.mode_nxt = (self.mode_cur + 1 + self.random.randrange(len(self.MODES) - 1)) % len(self.MODES)
+                self.mode_blend = 0.0
+        self.previous_bass = bass
+        self.previous_energy = energy
+        self.impulses = [p for p in self.impulses if now - p[0] < 0.85]
+        step_dt = min(dt, .05)
+        self.mode_blend = min(1.0, self.mode_blend + step_dt / 0.28)
+        target_vel = self.direction * (0.22 + act * (0.95 + 1.5 * mid + 0.9 * centroid + 0.7 * bass))
+        self.velocity += (target_vel - self.velocity) * (1 - math.exp(-dt / .24))
+        # Phases feed integer multiples only, so wrapping mod 2*pi is seamless and
+        # keeps float precision for unbounded sessions.
+        self.phase = (self.phase + self.velocity * step_dt) % TWO_PI
+        beat_pulse = max(0.0, math.cos(beat_phase)) ** 2 * beat_lock * act
+        hat_sync = (0.5 + 0.5 * math.cos(hat_phase)) * max(hat_f, 0.7 * high * hat_lock) * act
+        self.morph_clock = (self.morph_clock + (0.04 + act * (0.28 + 0.50 * energy + 0.40 * snare_f + 0.25 * beat_pulse)) * step_dt) % (8 * math.pi)
+        self.knot_phase = (self.knot_phase + self.direction * (0.12 + act * (0.65 + 1.1 * bass + 0.7 * mid + 0.5 * beat_pulse)) * step_dt) % TWO_PI
+        self.color_phase = (self.color_phase + (0.45 + act * (1.8 + 4.0 * energy + 2.0 * centroid + 1.8 * hat_sync)) * step_dt) % TWO_PI
+        self.tilt_phase = (self.tilt_phase + (0.18 + act * (0.85 + 1.6 * bass + 1.2 * kick_f)) * step_dt) % (20 * math.pi)
+        self.noise_clock += (0.35 + 1.4 * energy + 0.5 * beat_pulse) * step_dt
 
-        MAX_AGE = 1.35
-        updated = []
-        for birth, col in self.rings:
-            age = now - birth
-            if age < MAX_AGE:
-                updated.append((birth, col))
-        self.rings = updated[-2:]
+        # --- BPM-locked ring (spawn / expansion) ---
+        ring_onset = act > 0.18 and (kick_f > 0.24 or bass > 0.20 or snare_f > 0.28)
+        ring_color = (110, 220, 255) if kick_f >= snare_f else (255, 185, 80)
+        on_beat = self.rings.update(now, dt, beat_phase, beat_period, beat_lock, act, ring_onset, ring_color)
+        # Torsion spring: audio torque and each beat-ring birth wind the twist up;
+        # spring + damping release it, so the fold breathes in time with the BPM.
+        drive = 0.55 * (beat_pulse + 0.45 * kick_f + 0.25 * snare_f) * act
+        if on_beat:
+            self.twist_vel += 1.2 * act
+        self.twist_vel += (2.2 * drive - 6.0 * self.twist - 2.2 * self.twist_vel) * step_dt
+        self.twist = max(-0.85, min(0.85, self.twist + self.twist_vel * step_dt))
+        # Smooth periodic fold 0..2 (the snapshot's sawtooth rot4d popped at its wrap).
+        self.rot4d = (self.rot4d + (0.045 + act * (0.22 + 0.40 * energy + 0.18 * beat_pulse)) * step_dt) % TWO_PI
+        fold = FOLD_GAIN * (1.0 - math.cos(self.rot4d))
 
-        N_CORE = 220
-        amount = depth / 0.10
+        amount = depth / .10
         r_core = (2400.0 + 1900.0 * level) * (0.82 + 0.18 * act)
-        r_max = 8200.0
-        coords = []
-        colors = []
-        blanks = []
+        c_boost = 0.75 + 0.50 * centroid
+        f_boost = 1.0 + 0.40 * max(flux, kick_f)
+        low_amp = min(.40 * amount, .34 * amount * (bass + 0.28 * beat_pulse) * f_boost)
+        mid_amp = min(.26 * amount, .23 * amount * (mid + 0.30 * snare_f) * c_boost)
+        fine_amp = min(.038 * amount, .035 * amount * max(high, hat_sync) * c_boost)
+        imp_gain = .26 * amount * f_boost * act
+        m0_low, m0_mid = self.MODES[self.mode_cur]
+        m1_low, m1_mid = self.MODES[self.mode_nxt]
+        b1 = 0.5 - 0.5 * math.cos(math.pi * self.mode_blend)
+        b0 = 1.0 - b1
+        tilt_strength = 0.34 * max(0.5, amount) * act * (0.25 + 0.50 * bass + 0.25 * mid)
+        tx = tilt_strength * math.sin(self.tilt_phase)
+        ty = tilt_strength * math.cos(0.7 * self.tilt_phase)
+        hat_step_phase = 3 * self.phase + hat_phase
 
-        # --- 1. Centered Liquid Core Sphere (220 points) ---
-        for i in range(N_CORE):
-            a = 2 * math.pi * i / (N_CORE - 1)
-            blank = (i in (0, N_CORE - 1))
-            w = (0.26 * amount * bass * math.sin(2 * a - self.phase)
-                 + 0.13 * amount * mid * math.sin(3 * a + self.phase)
-                 + 0.025 * amount * high * math.sin(frequency * a - 2 * self.phase))
-            # Increased surface displacement (0.35 vs 0.22) with smooth non-clipping curve
-            r = r_core * (1.0 + 0.35 * math.tanh(1.2 * w))
-            px = r * math.cos(a)
-            py = r * math.sin(a)
-            coords.append((round(px), round(py)))
-            blanks.append(blank)
-            s_r = max(0.0, math.sin(a - self.color_phase)) ** 1.6
-            s_g = max(0.0, math.sin(a - self.color_phase + 2.094)) ** 1.6
-            s_b = max(0.0, math.sin(a - self.color_phase + 4.188)) ** 1.6
-            rc = int(min(255, 18 + 220 * s_r * (0.2 + 0.8 * bass)))
-            gc = int(min(255, 22 + 200 * s_g * (0.2 + 0.8 * (mid + high))))
-            bc = int(min(255, 60 + 190 * s_b))
-            colors.append((0, 0, 0) if blank else (rc, gc, bc))
+        a = _A
+        splash = np.zeros(N_CORE)
+        for start, angle0, travel in self.impulses:
+            age = max(0., now - start)
+            delta = a - angle0 - travel * 3.2 * age
+            packet = np.exp(2.0 * (np.cos(delta) - 1))
+            env = (1 - math.exp(-age / .02)) * math.exp(-age / .28)
+            splash += env * packet * np.cos(4 * delta - 12 * age)
+        w_low = b0 * np.sin(m0_low * a - self.phase) + b1 * np.sin(m1_low * a - self.phase)
+        w_mid = b0 * np.sin(m0_mid * a + 2 * self.phase) + b1 * np.sin(m1_mid * a + 2 * self.phase)
+        w_hat = np.sin(frequency * a - hat_step_phase)
+        arg = np.outer(self._oct_k, a) - (self._oct_w * self.noise_clock - self._oct_p)[:, None]
+        curl = ((self._oct_a * self._oct_k) @ np.cos(arg)) * (CURL_GAIN * amount * act)
+        # Fold gradient follows only the smooth low octaves (k<=7): at 220 pts/loop the k=11,13
+        # octaves alias into kinks once the fold rotates the ring through W.
+        psi = self._oct_a[:FOLD_OCTAVES] @ np.sin(arg[:FOLD_OCTAVES])
+        wave = low_amp * w_low + mid_amp * w_mid + fine_amp * w_hat + imp_gain * splash + curl
+        mod = 1.0 + 0.14 * np.tanh(1.5 * wave)
+        x0 = _COS_A * mod + 0.045 * wave * _COS_A
+        y0 = _SIN_A * mod + 0.045 * wave * _SIN_A
+        z0 = 0.09 * wave
+        # 4D fold: per-point gradient from the curl-noise potential, scaled by how
+        # wound the torsion spring is; only part of the ring sweeps through W.
+        g = np.clip(psi * 0.62, 0.0, 1.0)
+        grad = GRAD_MAX * (0.25 + 0.75 * g * g) * (0.35 + 0.65 * abs(self.twist))
+        ang4 = (fold + self.twist) * grad
+        c4, s4 = np.cos(ang4), np.sin(ang4)
+        w0 = x0 * s4
+        x0 = x0 * c4
+        z1 = z0 * c4 - w0 * s4
+        w0 = 0.08 * np.tanh((z0 * s4 + w0 * c4) / 0.08)   # smooth limit: a hard clip kinks the line
+        persp4 = 1.0 / (1.0 - 0.5 * w0)          # at most about +/-4% magnification
+        x0 = x0 * persp4
+        y0 = y0 * persp4
+        z0 = z1 * persp4
+        xr = x0 * math.cos(ty) + z0 * math.sin(ty)
+        yr = y0 * math.cos(tx) - z0 * math.sin(tx)
+        zr = -x0 * math.sin(ty) + y0 * math.sin(tx) + z0 * math.cos(tx) * math.cos(ty)
+        persp = 1.0 / (1.0 - 0.15 * np.clip(zr, -0.8, 0.8))
+        pts = np.stack((r_core * xr * persp, r_core * yr * persp), axis=1)
+        if self.previous is not None:
+            movement = float(np.max(np.hypot(*(pts - self.previous).T)))
+            blend = min(1.0, min(560.0, 22400.0 * max(dt, 0.01)) / max(1e-9, movement))
+            pts = self.previous + blend * (pts - self.previous)
+        pts[-1] = pts[0]                        # exact seam closure
+        self.previous = pts
+        core = np.rint(pts).astype(np.int64)
 
-        # --- 2. Outward Expanding Concentric Radio Rings (220 points) ---
-        N_RING = 220
-        for birth, col in self.rings:
-            age = now - birth
-            frac = age / MAX_AGE
-            rw = r_core + (r_max - r_core) * frac
-            fade = max(0.0, (1.0 - frac) ** 0.85) * act
-            if fade < 0.05: continue
-            coords.append(coords[-1])
-            colors.append((0, 0, 0))
-            blanks.append(True)
-            coords.append((round(rw * (1.0 + 0.16 * math.tanh(0.15 * bass * math.sin(0)))), 0))
-            colors.append((0, 0, 0))
-            blanks.append(True)
-            for j in range(N_RING):
-                a = 2 * math.pi * j / (N_RING - 1)
-                blank = (j in (0, N_RING - 1))
-                # Expanding radio wave ring carries undulating wave deformation
-                w_ring = 0.15 * bass * math.sin(2 * a - self.phase) + 0.08 * mid * math.sin(3 * a + self.phase)
-                r_ring = rw * (1.0 + 0.16 * math.tanh(w_ring) * fade)
-                ax = r_ring * math.cos(a)
-                ay = r_ring * math.sin(a)
-                coords.append((round(ax), round(ay)))
+        crest = np.minimum(1.0, np.maximum(0.0, splash) * act + 0.65 * hat_sync * np.maximum(0.0, w_hat)
+                           + 0.85 * act * np.abs(w0) * grad)
+        bass_glow = np.maximum(0.0, w_low) * max(bass, kick_f) * act
+        mid_glow = np.maximum(0.0, w_mid) * max(mid, snare_f) * act
+        hue = a * 2.0 - self.color_phase + 2.2 * wave
+        s_r = np.maximum(0.0, np.sin(hue)) ** 1.6
+        s_g = np.maximum(0.0, np.sin(hue + 2.094)) ** 1.6
+        s_b = np.maximum(0.0, np.sin(hue + 4.188)) ** 1.6
+        cr = np.minimum(255, 14 + 210 * s_r * (0.12 + 0.88 * act * (bass + 0.5 * energy)) + 150 * bass_glow + 140 * crest)
+        cg = np.minimum(255, 22 + 200 * s_g * (0.18 + 0.82 * act * (mid + high)) + 170 * crest)
+        cb = np.minimum(255, 55 + 195 * s_b * (0.40 + 0.60 * (1.0 - 0.3 * bass)) + 120 * mid_glow + 90 * crest)
+        core_col = np.stack((cr, cg, cb), axis=1).astype(np.int64)
+
+        coords = [tuple(p) for p in core.tolist()]
+        colors = [tuple(c) for c in core_col.tolist()]
+        blanks = [False] * N_CORE
+        blanks[0] = blanks[-1] = True
+        colors[0] = colors[-1] = (0, 0, 0)
+
+        # --- ring (one at a time, expansion fraction from BeatRings) ---
+        ring = self.rings.ring
+        fade = 0.0
+        if ring is not None:
+            frac = ring['frac']
+            fade = max(0.0, (1.0 - frac) ** 0.85) * (0.35 + 0.65 * act)
+        if ring is not None and fade >= 0.03:
+            r0 = 1.18 * r_core
+            rw = r0 + (RING_R_MAX - r0) * frac
+            col = ring['color']
+            w_ring = (0.12 * bass * np.sin(2 * _RING_A - self.phase) + 0.07 * mid * np.sin(3 * _RING_A + self.phase)
+                      + 0.06 * self.twist * np.sin(2 * _RING_A + 2 * self.phase))
+            r_ring = rw * (1.0 + 0.10 * np.tanh(w_ring) * min(1.0, 2.0 * fade))
+            rx = np.rint(r_ring * _RING_COS).astype(np.int64)
+            ry = np.rint(r_ring * _RING_SIN).astype(np.int64)
+            rpts = list(zip(rx.tolist(), ry.tolist()))
+            rpts[-1] = rpts[0]
+            coords.append(coords[-1]); colors.append((0, 0, 0)); blanks.append(True)
+            coords.append(rpts[0]); colors.append((0, 0, 0)); blanks.append(True)
+            lit = (int(col[0] * fade), int(col[1] * fade), int(col[2] * fade))
+            for j, p in enumerate(rpts):
+                blank = j in (0, N_RING - 1)
+                coords.append(p)
+                colors.append((0, 0, 0) if blank else lit)
                 blanks.append(blank)
-                colors.append((0, 0, 0) if blank else (int(col[0] * fade), int(col[1] * fade), int(col[2] * fade)))
-
+            # blanked walk back to the core seam (never one long jump)
+            walk = N_FRAME - len(coords)
+            ex, ey = rpts[-1]
+            sx, sy = coords[0]
+            for s in range(1, walk + 1):
+                t = s / walk
+                coords.append((round(ex + (sx - ex) * t), round(ey + (sy - ey) * t)))
+                colors.append((0, 0, 0)); blanks.append(True)
+        else:
+            # No visible ring: retrace the body so lit duty and refresh stay constant.
+            coords.extend(coords[1:N_CORE]); colors.extend(colors[1:N_CORE]); blanks.extend(blanks[1:N_CORE])
+            while len(coords) < N_FRAME:
+                coords.append(coords[0]); colors.append((0, 0, 0)); blanks.append(True)
+        self.colors = colors
         return coords, colors, blanks

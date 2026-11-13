@@ -154,9 +154,16 @@ class AudioTests(unittest.TestCase):
             h.run_audio(self.args(), sdk_factory=Term)
             self.assertTrue(Mic.instances[-1].closed)
             self.assertEqual((FakeSDK.instances[-1].stops, FakeSDK.instances[-1].closed), ([0],1))
-        for duration in (0, 301, float('nan')):
+        # Updated: the 300 s cap was removed on request. Non-positive/non-finite durations
+        # are still rejected; >300 s and None (unbounded) are accepted (Term stops via SIGTERM).
+        for duration in (0, -1, float('nan'), float('inf')):
             with self.assertRaises(h.CliError):
                 h.run_audio(self.args(duration))
+        with patch.object(h, 'Microphone', Mic):
+            for duration in (301, 86400, None):
+                h.run_audio(self.args(duration), sdk_factory=Term)
+                self.assertTrue(Mic.instances[-1].closed)
+                self.assertEqual((FakeSDK.instances[-1].stops, FakeSDK.instances[-1].closed), ([0], 1))
 
 
 class LatencyTests(unittest.TestCase):

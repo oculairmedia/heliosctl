@@ -106,7 +106,7 @@ chmod +x heliosctl
 Start the 5-minute living concentric radio-wave visualizer:
 
 ```bash
-./heliosctl audio --duration 300 --live-control --pattern liquid --gain 3 --base-size 1.0
+./heliosctl audio --live-control --pattern liquid --gain 3 --base-size 1.0
 ```
 
 ### Live Control & Real-Time Tuning
@@ -116,7 +116,7 @@ From another terminal (or an agent/script) while the laser is running:
 ```bash
 ./heliosctl status
 ./heliosctl tune --gain 2.5 --ripple-depth .08 --frequency 6
-./heliosctl renew 300    # extend 5-minute session timer
+./heliosctl renew 300    # replace the deadline with 300 s from now (not needed when --duration is omitted)
 ./heliosctl stop         # cleanly shuts off laser output
 ```
 

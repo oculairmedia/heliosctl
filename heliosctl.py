@@ -245,8 +245,9 @@ def group_file_frames(frames, pps):
 
 
 def run_play(args, sdk_factory=HeliosSDK, clock=time.monotonic, sleeper=time.sleep, live_frames=None):
-    if not math.isfinite(args.duration) or args.duration <= 0 or args.duration > 300:
-        raise CliError("duration must be finite, > 0 and <= 300 seconds")
+    # duration=None means run until stopped (Ctrl-C/SIGTERM or `heliosctl stop`).
+    if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
+        raise CliError("duration must be finite and > 0 seconds (omit for unbounded)")
     if args.pps < 1000 or args.pps > MAX_PPS:
         raise CliError(f"pps must be between 1000 and {MAX_PPS}")
     if not math.isfinite(args.ready_timeout) or args.ready_timeout <= 0 or args.ready_timeout > 30:
@@ -276,7 +277,7 @@ def run_play(args, sdk_factory=HeliosSDK, clock=time.monotonic, sleeper=time.sle
         opened = True
         if devices != 1:
             raise CliError(f"requires exactly one isolated USB DAC; opened {devices}. SDK discovery/close affects all discovered DACs")
-        deadline = clock() + args.duration
+        deadline = math.inf if args.duration is None else clock() + args.duration
         control = getattr(args, '_control', None)
         if control:
             control.deadline = deadline
@@ -555,7 +556,8 @@ class AudioFrames:
                                                         hat_phase=self.bands.hat_phase,
                                                         beat_lock=self.bands.beat_lock,
                                                         hat_lock=self.bands.hat_lock,
-                                                        activity=self.bands.activity)
+                                                        activity=self.bands.activity,
+                                                        beat_period=self.bands.beat_period)
             self.onset_count = self.liquid.onsets
         if self.meter and now >= self.next_meter:
             if self.pattern == 'liquid':
@@ -579,8 +581,8 @@ class AudioFrames:
 
 
 def run_audio(args, sdk_factory=HeliosSDK):
-    if not math.isfinite(args.duration) or not 0 < args.duration <= 300:
-        raise CliError("audio duration must be finite, > 0 and <= 300 seconds")
+    if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
+        raise CliError("audio duration must be finite and > 0 seconds (omit for unbounded)")
     gain = getattr(args, 'gain', 1.0)
     if not math.isfinite(gain) or not 0 < gain <= 32:
         raise CliError("audio gain must be finite, > 0 and <= 32")
@@ -663,12 +665,12 @@ def main(argv=None):
     pv.add_argument("--out", required=True)
     play = sub.add_parser("play", help="bounded playback; each frame uses SDK single-mode")
     play.add_argument("file")
-    play.add_argument("--duration", required=True, type=float, help="required playback time (0 < seconds <= 300)")
+    play.add_argument("--duration", type=float, default=None, help="playback time in seconds (>0); omit to play until stopped")
     play.add_argument("--pps", type=int, default=20000)
     play.add_argument("--ready-timeout", type=float, default=2.0)
     play.add_argument("--library", default=default_library())
     audio = sub.add_parser("audio", help="bounded internal-microphone reactive ellipse (opens DAC)")
-    audio.add_argument("--duration", required=True, type=float, help="required seconds, >0 and <=300")
+    audio.add_argument("--duration", type=float, default=None, help="seconds (>0); omit to run until stopped (Ctrl-C, SIGTERM or `heliosctl stop`)")
     audio.add_argument("--library", default=default_library())
     audio.add_argument('--gain', type=float, default=1.0, help='RMS geometry gain, >0 and <=32 (default 1; never changes intensity)')
     audio.add_argument('--meter', action='store_true', help='print aggregate RMS/target once per second during playback')
