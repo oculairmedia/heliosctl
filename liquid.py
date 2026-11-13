@@ -59,6 +59,14 @@ class Bands:
         self.peak_hold = 0.      # loudness peak of the last ~kick (decays in 0.25 s)
         self.peak_ref = 0.       # loudest kick of the last ~10 s (max-hold): a kick far above it is a drop
         self.accent = 0.
+        # whole-spectrum event size (see update): how big this frame's onset is against the
+        # biggest of the last few seconds, independent of which band it lives in
+        self.prev_mag = None
+        self.prev_loud2 = 0.
+        self.flux_lin_peak = 1e-3
+        self.rms_peak = 1e-5
+        self.hit_flux = 0.
+        self.hit_rms = 0.
 
     def update(self, samples, dt):
         if len(samples) != 320:
@@ -81,6 +89,7 @@ class Bands:
         if self.diagnostic != 'ok':
             self.flux = 0.
             self.sub_flux = [0., 0., 0.]
+            self.hit_flux = self.hit_rms = 0.
             self.activity *= math.exp(-dt / 0.25)
             self.beat_lock *= math.exp(-dt / 0.6)    # no music: confidence fades, never sticks
             return self.decay(dt)
@@ -131,12 +140,37 @@ class Bands:
                 self.sub_flux[idx] = act_gate * min(1.0, max(0.0, rf - 0.75 * base) / max(0.022, 1.10 * base))
                 self.sub_flux_base[idx] += (rf - base) * (1.0 - math.exp(-dt / 1.0))
         self.prev_log_spec = log_spec
+        # Whole-spectrum event size (REPORT-ESSENTIA 3b): positive linear-magnitude flux and the
+        # frame energy step, each against its own decaying peak: ~1 for the biggest hit of the
+        # last seconds, ~0.2 (flux) / ~0.06 (rms) for a hat under it, whatever the gain.  The
+        # banded sub_flux names a hit's kind; this says how big it is.
+        mag = np.sqrt(spec320)
+        loud2 = frame_loud * frame_loud
+        if self.prev_mag is not None:
+            lin = float(np.sum(np.maximum(0.0, mag - self.prev_mag)))
+            rstep = max(0.0, loud2 - self.prev_loud2)
+        else:
+            lin = rstep = 0.0
+        self.prev_mag, self.prev_loud2 = mag, loud2
+        self.flux_lin_peak = max(lin, 1e-3, self.flux_lin_peak * math.exp(-dt / 4.0))
+        self.rms_peak = max(rstep, 1e-5, self.rms_peak * math.exp(-dt / 4.0))
+        self.hit_flux = act_gate * min(1.0, lin / self.flux_lin_peak)
+        self.hit_rms = act_gate * min(1.0, rstep / self.rms_peak)
 
         step_dt = max(0.005, min(0.05, dt))
         beat_drive = max(self.sub_flux[0], 0.85 * self.sub_flux[1])
         hat_drive = self.sub_flux[2]
+        # Kick-likeness of this frame: the bass log-energy jump against its recent peak (the
+        # PLL's own kick test below).  The tempo comb's history weights kick frames up by
+        # KICK_COMB_W so eighth-note hats and backbeat snares, which feed the same drive, cannot
+        # outvote the kicks' period (70 BPM rock read as 140: REPORT-ESSENTIA 1).
+        bass_log = math.log(self.energy[0] + 1e-4)
+        kick = max(0.0, bass_log - self.bass_log)
+        self.bass_log = bass_log
+        self.kick_peak = max(kick, 0.3, self.kick_peak * math.exp(-step_dt / 2.5))
+        kick_like = min(1.0, kick / self.kick_peak) if beat_drive > 0.16 else 0.0
         self.clock += dt
-        self.beat_hist = (self.beat_hist + [beat_drive])[-300:]
+        self.beat_hist = (self.beat_hist + [beat_drive * (1.0 + self.KICK_COMB_W * kick_like)])[-300:]
         self.beat_t = (self.beat_t + [self.clock])[-300:]
         self.hat_hist = (self.hat_hist + [hat_drive])[-160:]
         if len(self.beat_hist) >= 64 and len(self.beat_hist) % 4 == 0:
@@ -167,10 +201,6 @@ class Bands:
         self.beat_phase = (self.beat_phase + 2 * math.pi * step_dt / period) % (2 * math.pi)
         # Only kick-like onsets steer the phase: a bass log-energy jump near its recent peak.
         # Snares and fills feed the tempo comb but would otherwise pull phase 0 onto the backbeat.
-        bass_log = math.log(self.energy[0] + 1e-4)
-        kick = max(0.0, bass_log - self.bass_log)
-        self.bass_log = bass_log
-        self.kick_peak = max(kick, 0.3, self.kick_peak * math.exp(-step_dt / 2.5))
         # The bass jump, not the first flux frame, times the kick: a kick starting late in a
         # 20 ms block shows flux there but lands its energy in the next block.
         is_kick = (beat_drive > 0.16 and kick > 0.6 * self.kick_peak
@@ -271,6 +301,7 @@ class Bands:
         self.accent = max(min(3.0, raw), self.accent * math.exp(-dt / self.ACCENT_TAU))
 
     TEMPO_MIN, TEMPO_MAX = 0.30, 1.20   # beat period search, s (50-200 BPM)
+    KICK_COMB_W = 1.0                   # a kick frame counts (1 + this) x in the tempo comb history
     TEMPO_GRID = 0.01                   # onset curve is resampled to 10 ms before the comb
     BEAT_LATENCY = 0.035                # kick audio -> detected onset frame, s (block fill + newest-block wait + frame)
 
