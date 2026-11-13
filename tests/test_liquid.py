@@ -383,3 +383,112 @@ class FrameBlankingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EarnedRingTests(unittest.TestCase):
+    """Rings are earned by musical accents, not emitted on every beat. With an accent
+    supplied, a steady passage births a ring only at an energy-dependent floor rate; a
+    rise in accent earns one on the next beat; the body punches on every beat anyway."""
+    def drive(self, seconds, act, accent, period=.5, lock=.9, dt=.0225, start=0.):
+        r = BeatRings()
+        births, hits, phases = [], 0, []
+        n = int(seconds / dt)
+        for i in range(n):
+            now = i * dt
+            phase = (now * 2 * math.pi / period) % (2 * math.pi)
+            acc = accent(now) if callable(accent) else accent
+            before = r.spawned['beat']
+            r.update(now, dt, phase, period, lock, act, False, (1, 2, 3), accent=acc)
+            hits += r.beat_hit
+            if r.spawned['beat'] > before:
+                births.append(now)
+                phases.append(min(phase, 2 * math.pi - phase))
+        return r, births, hits, phases
+
+    def test_steady_passage_earns_rings_at_the_floor_not_every_beat(self):
+        r, births, hits, phases = self.drive(20, act=.9, accent=0.)
+        beats = 20 / .5
+        self.assertGreaterEqual(hits, beats - 2)                  # the body is told about every beat
+        self.assertLessEqual(len(births), .5 * beats)             # ...but most beats earn no ring
+        expected = 20 / BeatRings.FLOOR_MIN                       # act .9 -> floor gap ~1.5 s
+        self.assertGreaterEqual(len(births), .6 * expected)       # never a dead wall
+        self.assertLessEqual(len(births), 1.4 * expected)
+        for p in phases:                                          # every floor ring is still on the beat
+            self.assertLess(p, 2 * math.pi * .0225 / .5 + 1e-9)
+        self.assertEqual(r.spawned['onset'] + r.spawned['idle'], 0)
+        self.assertEqual(r.ring['weight'] if r.ring else .5, .5)  # a floor ring is a soft ring
+
+    def test_ring_density_follows_energy(self):
+        _, loud, _, _ = self.drive(30, act=.9, accent=0.)
+        _, quiet, _, _ = self.drive(30, act=.15, accent=0.)
+        self.assertGreaterEqual(len(loud), 14)
+        self.assertLessEqual(len(quiet), .5 * len(loud))
+        self.assertGreaterEqual(len(quiet), 3)                    # quiet is sparse, not dead
+
+    def test_accent_earns_a_ring_on_the_next_beat(self):
+        # 8 s of nothing special, then an accent (a drop): a ring on the first beat after it.
+        r, births, _, _ = self.drive(12, act=.9, accent=lambda t: 0. if t < 8. else 1.5)
+        after = [b for b in births if b >= 8.]
+        self.assertTrue(after)
+        self.assertLess(after[0] - 8., .5 + .0225)                # the very next wrap
+        self.assertEqual(r.ring['weight'] if r.ring else 1., 1.)  # at full strength
+        # and a sustained accent of 1 (loudness doubled) earns about one ring per beat
+        _, births, _, _ = self.drive(10, act=.9, accent=1.)
+        self.assertGreaterEqual(len(births), .8 * 10 / .5)
+
+    def test_silence_earns_nothing_whatever_the_accent(self):
+        r, births, hits, _ = self.drive(10, act=0., accent=2.)
+        self.assertEqual(r.spawned, {'beat': 0, 'onset': 0, 'idle': 0})
+        self.assertEqual(hits, 0)
+
+    def test_body_punches_on_every_beat_without_a_ring(self):
+        from liquid import BEAT_PUNCH
+        c, period, dt, now = LiquidContour(), .5, .0225, 0.
+        births, rises, ring_punch, beat_punch = 0, 0, [], []
+        prev = 0.
+        for i in range(int(20 / dt)):
+            now = i * dt
+            phase = (now * 2 * math.pi / period) % (2 * math.pi)
+            before = c.rings.spawned['beat']
+            c.sample(.3, [.05, .05, .05], now, dt, .07, 5, beat_phase=phase, beat_lock=.9, activity=.8,
+                     beat_period=period, accent=0.)
+            if c.punch > prev:
+                rises += 1
+                (ring_punch if c.rings.spawned['beat'] > before else beat_punch).append(c.punch)
+            births += c.rings.spawned['beat'] > before
+            prev = c.punch
+        self.assertGreaterEqual(rises, 20 / period - 2)           # a punch on every beat
+        self.assertLessEqual(births, .5 * 20 / period)            # with far fewer rings
+        self.assertTrue(beat_punch)
+        for p in beat_punch:
+            self.assertAlmostEqual(p, BEAT_PUNCH * math.exp(-dt / .09), delta=1e-6)
+        for p in ring_punch:
+            self.assertAlmostEqual(p, math.exp(-dt / .09), delta=1e-6)   # a ring birth hits harder
+
+    def test_real_chain_steady_groove_mostly_passes_without_rings(self):
+        # Full chain, heliosctl timing, accent from Bands: a steady 128 BPM groove shows a
+        # ring every few beats once the opening has settled, not on every beat.
+        pcm, beats, period = drum_track(128, .5, 16., 'four')
+        b, c, seq_prev, frame = Bands(), LiquidContour(), -1, .0225
+        births = []
+        for i in range(int(16. / frame)):
+            now = (i + 1) * frame
+            seq = int(now / .02) - 1
+            if seq != seq_prev:
+                levels, seq_prev = b.update(pcm[seq * 320:(seq + 1) * 320].tolist(), frame), seq
+            else:
+                levels = b.decay(frame)
+            before = c.rings.spawned['beat']
+            c.sample(.3, [math.sqrt(min(1., max(0., v))) for v in levels], now, frame, .07, 5,
+                     flux=b.flux, sub_flux=b.sub_flux, beat_phase=b.beat_phase, beat_lock=b.beat_lock,
+                     activity=b.activity, beat_period=b.beat_period, accent=b.accent)
+            if c.rings.spawned['beat'] > before:
+                births.append(now)
+        self.assertGreater(b.beat_lock, BeatRings.LOCK_ON)
+        self.assertLess(b.accent, .5)                             # a steady groove is not an accent
+        late = [t for t in births if t >= 10.]
+        n_beats = sum(1 for t in beats if t >= 10.)
+        self.assertLessEqual(len(late), .6 * n_beats, f'{len(late)} rings on {n_beats} beats')
+        self.assertGreaterEqual(len(late), 2)                     # but the floor keeps it alive
+        for t in late:                                            # and each one is on the beat
+            self.assertLess(min(abs(t - beats)), .035)
